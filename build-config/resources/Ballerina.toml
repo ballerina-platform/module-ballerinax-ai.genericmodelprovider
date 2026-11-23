@@ -1,0 +1,19 @@
+[package]
+authors = ["Ballerina"]
+distribution = "2201.12.0"
+keywords = ["Agent", "Model", "Provider", "Vendor/OpenAI Compatible", "Area/AI & Machine Learning", "Type/Model Provider", "Type/Connector", "Name/Generic Model Provider", "Generic", "OpenAI Compatible", "Groq", "Together AI", "Fireworks", "xAI", "GLM", "vLLM", "LM Studio", "Ollama"]
+license = ["Apache-2.0"]
+icon="icon.png"
+name = "ai.genericmodelprovider"
+org = "ballerinax"
+repository = "https://github.com/ballerina-platform/module-ballerinax-ai.genericmodelprovider"
+version = "@toml.version@"
+
+[platform.java21]
+graalvmCompatible = true
+
+[[platform.java21.dependency]]
+groupId = "io.ballerina.lib"
+artifactId = "ai.genericmodelprovider-native"
+version = "@toml.version@"
+path = "../native/build/libs/ai.genericmodelprovider-native-@project.version@.jar"
