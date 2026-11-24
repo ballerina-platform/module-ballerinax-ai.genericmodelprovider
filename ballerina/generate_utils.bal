@@ -280,11 +280,7 @@ isolated function sendJsonSchemaRequest(GenerateRequestContext ctx) returns Gene
     };
     GenerateAttempt attempt = sendGenerateChatCompletion(ctx, [buildGenerateUserMessage(ctx)], fields);
     ChatCompletionResponse|ai:Error response = attempt.response;
-    // The format or mode must be named in the error message itself: servers report errors about the schema contents
-    // with `param: response_format` too.
-    if response is ai:Error && !isSchemaRejected(response)
-            && (isUnsupportedFieldError(response, "response_format", matchParam = false)
-                || isUnsupportedFieldError(response, "json_schema", matchParam = false)) {
+    if response is ai:Error && isJsonSchemaFormatUnsupported(response) {
         log:printWarn(string `The server does not support 'response_format' of type 'json_schema' for model '${
                 ctx.modelType}'; retrying with 'json_object'`, statusCode = getStatusCode(response));
         return sendJsonObjectRequest(ctx, MAX_GENERATE_REQUESTS - 1);
@@ -329,6 +325,34 @@ isolated function sendJsonObjectRequest(GenerateRequestContext ctx, int maxReque
 # + return - `true` if the response has at least one choice
 isolated function isUsableResponse(ChatCompletionResponse|ai:Error response) returns boolean =>
     response is ChatCompletionResponse && getFirstChoice(response) is ChatChoice;
+
+# Checks whether the server rejected the `json_schema` response format (or `response_format` itself) as unsupported.
+# The error message must say that the format or mode itself is unsupported (e.g. "'response_format' of type
+# 'json_schema' is not supported", "Unrecognized request argument supplied: response_format"). Errors that only
+# mention the format, such as "For response_format, patternProperties is not supported" or an error whose `param` is
+# `response_format`, concern the schema contents and must not fall back to a mode that does not enforce the schema.
+#
+# + err - The error
+# + return - `true` if the format itself is unsupported
+isolated function isJsonSchemaFormatUnsupported(error err) returns boolean {
+    if !isRequestRejected(err) || isSchemaRejected(err) {
+        return false;
+    }
+    foreach string diagnostic in getProviderErrorDiagnostics(err, includeParam = false) {
+        // Quotes around names vary between servers, so they are ignored.
+        string text = diagnostic;
+        foreach string quote in ["'", "\"", "`"] {
+            text = replaceAllOccurrences(text, quote, "");
+        }
+        if re `(response_format|json_schema)( of type json_schema)? (is )?(not supported|unsupported|not allowed|not permitted|unknown)`.find(text) !is ()
+                || re `(unsupported|unknown|unrecognized|unexpected)( request)? (argument|parameter|field|keyword argument)s?( supplied)?:? (response_format|json_schema)`.find(text) !is ()
+                || re `unsupported (response_format|json_schema)`.find(text) !is ()
+                || re `\[body, ?response_format\] extra (inputs|fields)`.find(text) !is () {
+            return true;
+        }
+    }
+    return false;
+}
 
 # Checks whether the server rejected the contents of the JSON schema (e.g. a schema keyword it does not support),
 # rather than the `json_schema` response format itself. Such errors must not fall back to a mode that does not
@@ -560,6 +584,14 @@ isolated function extractJsonFromText(string text) returns ParsedJson? {
     if parsed is ParsedJson {
         return parsed;
     }
+    // A `</think>` taken as the end of the leading reasoning may instead be inside a JSON string of the answer.
+    string withoutDanglingStrip = stripLeadingThinkBlocks(trimmed, false);
+    if withoutDanglingStrip != cleaned {
+        parsed = parseJsonCandidates(withoutDanglingStrip);
+        if parsed is ParsedJson {
+            return parsed;
+        }
+    }
     string fullyCleaned = stripThinkBlocks(cleaned).trim();
     return fullyCleaned == cleaned ? () : parseJsonCandidates(fullyCleaned);
 }
@@ -596,8 +628,9 @@ isolated function parseJsonCandidates(string text) returns ParsedJson? {
 # `</think>` that is not preceded by `<think>`. Tags later in the text are kept.
 #
 # + text - The text
+# + stripDangling - Whether to remove the text before a dangling `</think>`
 # + return - The text without the leading reasoning
-isolated function stripLeadingThinkBlocks(string text) returns string {
+isolated function stripLeadingThinkBlocks(string text, boolean stripDangling = true) returns string {
     string result = text.trim();
     while result.startsWith(THINK_START_TAG) {
         int? endIndex = result.indexOf(THINK_END_TAG);
@@ -605,6 +638,9 @@ isolated function stripLeadingThinkBlocks(string text) returns string {
             return result;
         }
         result = result.substring(endIndex + THINK_END_TAG.length()).trim();
+    }
+    if !stripDangling {
+        return result;
     }
     int? danglingEnd = result.indexOf(THINK_END_TAG);
     int? startIndex = result.indexOf(THINK_START_TAG);

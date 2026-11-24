@@ -45,6 +45,7 @@ const MOCK_INVALID_SCHEMA_ERROR = "Invalid schema for response_format 'json_sche
         "'additionalProperties' is required to be supplied and to be false.";
 const MOCK_SCHEMA_KEYWORD_ERROR = "Invalid schema: patternProperties is not supported";
 const MOCK_BARE_KEYWORD_ERROR = "patternProperties is not supported";
+const MOCK_CLOSE_TAG_STRING = "a</think>c";
 const MOCK_THINK_TAG_STRING = "a<think>b</think>c";
 const MOCK_NO_TOOLS_ERROR = "registry.ollama.ai/library/x does not support tools";
 const MOCK_NO_RESPONSE_FORMAT_ERROR = "Unrecognized request argument supplied: response_format";
@@ -425,6 +426,9 @@ isolated function mockGetGenerateValue(string prompt) returns json {
     }
     if prompt.includes("GEN_INT") {
         return 2;
+    }
+    if prompt.includes("GEN_CLOSE_TAG_STRING") {
+        return MOCK_CLOSE_TAG_STRING;
     }
     if prompt.includes("GEN_THINK_STRING") {
         return MOCK_THINK_TAG_STRING;

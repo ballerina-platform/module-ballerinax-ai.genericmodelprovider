@@ -304,3 +304,101 @@ function toolCallChoiceWithId(string? id, string arguments, string reasoning) re
         "tool_calls": [{"id": id, "type": "function", "function": {"name": "getWeather", "arguments": arguments}}]
     }
 };
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Second round of follow-ups
+// ---------------------------------------------------------------------------------------------------------------------
+
+@test:Config {groups: ["errors"]}
+function testJsonEscapedCredentialIsRedacted() returns error? {
+    map<string> & readonly headers = {"x-api-key": "abc\"def12"};
+    test:assertEquals(redactCredentials("{\"error\": \"bad key abc\\\"def12\"}", headers), "{\"error\": \"bad key ***\"}");
+
+    string quotedKey = "k\"y";
+    ModelProvider quotedKeyProvider = check new (mockUrl(STANDARD), TEST_MODEL, quotedKey);
+    ai:ChatAssistantMessage|ai:Error result = quotedKeyProvider->chat(
+            {role: ai:USER, content: "TRIGGER_ECHO_AUTH hello"});
+    if result !is ai:LlmConnectionError {
+        test:assertFail(string `Expected ai:LlmConnectionError, found: ${describe(result)}`);
+    }
+    test:assertFalse(result.message().includes(quotedKey), "The decoded key must not appear in the message");
+    test:assertFalse(getErrorBody(result).includes("k\\\"y"), "The escaped key must not appear in the body");
+    test:assertTrue(result.message().includes(REDACTED_CREDENTIAL));
+}
+
+@test:Config {groups: ["errors"]}
+function testShortCredentialIsRedactedOnlyWhereItStandsAlone() {
+    test:assertEquals(redactCredentials("key a rejected; 'max_tokens' is not supported",
+            {"Authorization": "Bearer a"}), "key *** rejected; 'max_tokens' is not supported");
+}
+
+@test:Config {groups: ["adaptive"]}
+function testMaxTokensFallbackWorksWithShortApiKey() returns error? {
+    ModelProvider oProvider = check new (mockUrl(OSERIES), "o4-mini", "a", maxTokens = 16);
+    int initialCount = getRequestCount(OSERIES);
+    ai:ChatAssistantMessage response = check oProvider->chat({role: ai:USER, content: "Short key"});
+    test:assertEquals(response.content, MOCK_TEXT_RESPONSE_PREFIX + "Short key");
+    test:assertEquals(getRequestCount(OSERIES), initialCount + 2,
+            "Redacting a short key must not prevent the 'max_completion_tokens' retry");
+}
+
+@test:Config {groups: ["adaptive"]}
+function testJsonSchemaFormatUnsupportedDetection() {
+    [json, boolean][] cases = [
+        [{"error": {"message": "For response_format, patternProperties is not supported"}}, false],
+        [{"error": {"param": "response_format", "message": "patternProperties is not supported"}}, false],
+        [{"error": {"message": "Invalid schema for response_format 'x': 'patternProperties' is not supported"}}, false],
+        [{"error": {"message": MOCK_JSON_SCHEMA_ERROR}}, true],
+        [{"error": {"message": "Unrecognized request argument supplied: response_format"}}, true],
+        [{"error": {"message": "response_format is not supported by this model"}}, true],
+        [{"detail": [{"loc": ["body", "response_format"], "msg": "Extra inputs are not permitted"}]}, true]
+    ];
+    foreach [json, boolean] [body, expected] in cases {
+        ai:LlmConnectionError err = error ai:LlmConnectionError("rejected", statusCode = 400,
+                body = body.toJsonString());
+        test:assertEquals(isJsonSchemaFormatUnsupported(err), expected, body.toJsonString());
+    }
+}
+
+@test:Config {groups: ["chat"]}
+function testToolCallWithoutReasoningMakesIdenticalCallAmbiguous() returns error? {
+    foreach boolean reasoningFirst in [true, false] {
+        ReasoningStore store = new;
+        json withReasoning = toolCallChoiceWithId((), "{}", MOCK_REASONING_TEXT);
+        json withoutReasoning = {
+            "message": {
+                "role": "assistant",
+                "tool_calls": [{"id": (), "type": "function", "function": {"name": "getWeather", "arguments": "{}"}}]
+            }
+        };
+        ai:ChatAssistantMessage first = check convertToAssistantMessage(
+                check toChoice(reasoningFirst ? withReasoning : withoutReasoning), store);
+        ai:ChatAssistantMessage second = check convertToAssistantMessage(
+                check toChoice(reasoningFirst ? withoutReasoning : withReasoning), store);
+        foreach ai:ChatAssistantMessage assistant in [first, second] {
+            json[] request = check buildChatRequestMessages([{role: ai:USER, content: "Q"}, assistant], SYSTEM, store);
+            test:assertFalse((check asMap(request[1])).hasKey("reasoning_content"),
+                    "Reasoning must be omitted when an identical call arrived without reasoning");
+        }
+    }
+}
+
+@test:Config {groups: ["chat"]}
+function testEvictedReasoningKeyIsAmbiguousWhenReused() {
+    ReasoningStore store = new;
+    store.put("reused-key", "Reasoning of conversation A");
+    foreach int i in 0 ..< MAX_REASONING_ENTRIES {
+        store.put(string `other-key-${i}`, "Other reasoning");
+    }
+    test:assertEquals(store.get("reused-key"), (), "The oldest key must have been evicted");
+    store.put("reused-key", "Reasoning of conversation B");
+    test:assertEquals(store.get("reused-key"), (),
+            "A key evicted earlier must not return reasoning that may belong to another conversation");
+}
+
+@test:Config {groups: ["generate"]}
+function testGeneratePreservesClosingThinkTagInsideFencedJson() returns error? {
+    ModelProvider ollamaProvider = check new (mockUrl(OLLAMA), "llama3.2");
+    string result = check ollamaProvider->generate(`GEN_CLOSE_TAG_STRING Say something`);
+    test:assertEquals(result, MOCK_CLOSE_TAG_STRING);
+}

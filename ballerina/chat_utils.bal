@@ -273,11 +273,11 @@ isolated function convertToAssistantMessage(ChatChoice choice, ReasoningStore? r
     }
 
     if reasoningStore is ReasoningStore {
-        string? reasoning = getReasoningContent(message) ?: thinkReasoning;
-        if reasoning is string {
-            foreach ai:FunctionCall functionCall in functionCalls {
-                reasoningStore.put(getReasoningKey(functionCall), reasoning);
-            }
+        // Tool calls without reasoning are recorded too, so that an identical tool call from another response
+        // cannot receive this response's reasoning (or the other way around).
+        string reasoning = getReasoningContent(message) ?: thinkReasoning ?: NO_REASONING;
+        foreach ai:FunctionCall functionCall in functionCalls {
+            reasoningStore.put(getReasoningKey(functionCall), reasoning);
         }
     }
 

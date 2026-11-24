@@ -23,6 +23,11 @@ const PROVIDER_NAME = "openai-compatible";
 const MAX_REASONING_ENTRIES = 1000;
 const MAX_LOGGED_BODY_LENGTH = 1000;
 const REDACTED_CREDENTIAL = "***";
+# Credentials shorter than this are redacted only where they stand alone, so that redacting a short key does not
+# alter request field names (e.g. `max_tokens`) that fallback decisions rely on
+const MIN_SUBSTRING_REDACTED_CREDENTIAL_LENGTH = 8;
+const NO_REASONING = "";
+const MAX_EVICTED_REASONING_KEYS = 10000;
 
 # Remembers request-shape fallbacks learned at runtime for a single provider instance, so that a
 # rejected optional feature is retried only once per provider instance.
@@ -88,13 +93,21 @@ isolated class AdaptiveState {
 # Stores reasoning content returned with tool calls, keyed by `getReasoningKey`, so it can be sent back on the
 # corresponding assistant message in later turns (only used when `preserveReasoningContent` is enabled).
 # The store is bounded; the oldest entries are evicted once `MAX_REASONING_ENTRIES` is reached.
-# If two responses produce the same key with different reasoning (identical tool calls whose originating response
-# cannot be told apart), the key is marked ambiguous and no reasoning is returned for it, rather than reasoning that
-# may belong to another response.
+# Reasoning is returned only when the key identifies a single response. A key is marked ambiguous, and no reasoning
+# is returned for it, when identical tool calls (whose originating responses cannot be told apart) arrive with
+# different reasoning, or with and without reasoning, or when a key that was evicted earlier arrives again (a
+# conversation may still refer to the evicted entry).
 isolated class ReasoningStore {
-    # Reasoning by key; `()` marks an ambiguous key
+    # Reasoning by key: the reasoning, `NO_REASONING` for a tool call returned without reasoning, or `()` for an
+    # ambiguous key
     private final map<string?> reasoningByToolCall = {};
+    # Recently evicted keys (bounded by `MAX_EVICTED_REASONING_KEYS`)
+    private final map<()> evictedKeys = {};
 
+    # Records the reasoning returned with a tool call.
+    #
+    # + key - The key of the tool call (see `getReasoningKey`)
+    # + reasoning - The reasoning, or `NO_REASONING` if the tool call was returned without reasoning
     isolated function put(string key, string reasoning) {
         lock {
             if self.reasoningByToolCall.hasKey(key) {
@@ -107,14 +120,28 @@ isolated class ReasoningStore {
                 // Maps preserve insertion order, so the first key is the oldest entry.
                 string oldest = self.reasoningByToolCall.keys()[0];
                 _ = self.reasoningByToolCall.remove(oldest);
+                if self.evictedKeys.length() >= MAX_EVICTED_REASONING_KEYS {
+                    _ = self.evictedKeys.remove(self.evictedKeys.keys()[0]);
+                }
+                self.evictedKeys[oldest] = ();
+            }
+            if self.evictedKeys.hasKey(key) {
+                _ = self.evictedKeys.remove(key);
+                self.reasoningByToolCall[key] = ();
+                return;
             }
             self.reasoningByToolCall[key] = reasoning;
         }
     }
 
+    # Returns the reasoning recorded for a tool call.
+    #
+    # + key - The key of the tool call
+    # + return - The reasoning, or `()` if there is none or the key is ambiguous
     isolated function get(string key) returns string? {
         lock {
-            return self.reasoningByToolCall[key];
+            string? reasoning = self.reasoningByToolCall[key];
+            return reasoning == NO_REASONING ? () : reasoning;
         }
     }
 }
@@ -230,7 +257,8 @@ isolated function postJson(http:Client llmClient, string path, map<string> & rea
         string message = string `Error while connecting to the model: HTTP ${statusCode}`;
         string? providerMessage = extractProviderErrorMessage(responseBody);
         if providerMessage is string {
-            message = string `${message}: ${providerMessage}`;
+            // Redacted again in case the extracted message decodes an escaped form that was not matched.
+            message = string `${message}: ${redactCredentials(providerMessage, headers)}`;
         }
         log:printDebug("OpenAI-compatible endpoint returned an error response", statusCode = statusCode,
                 body = truncate(responseBody, MAX_LOGGED_BODY_LENGTH));
@@ -265,10 +293,17 @@ isolated function redactCredentials(string text, map<string> & readonly headers)
                 secret = secret.substring(schemeEnd + 1).trim();
             }
         }
-        // Credentials of any length are redacted: leaking a short key is worse than masking unrelated text.
-        if secret != "" {
-            redacted = replaceAllOccurrences(redacted, secret, REDACTED_CREDENTIAL);
+        if secret == "" {
+            continue;
         }
+        boolean standaloneOnly = secret.length() < MIN_SUBSTRING_REDACTED_CREDENTIAL_LENGTH;
+        // The credential may also be echoed inside a JSON string, where characters such as `"` are escaped.
+        string escaped = secret.toJsonString();
+        escaped = escaped.substring(1, escaped.length() - 1);
+        if escaped != secret {
+            redacted = replaceAllOccurrences(redacted, escaped, REDACTED_CREDENTIAL, standaloneOnly);
+        }
+        redacted = replaceAllOccurrences(redacted, secret, REDACTED_CREDENTIAL, standaloneOnly);
     }
     return redacted;
 }
@@ -292,17 +327,39 @@ isolated function isCredentialHeader(string name) returns boolean {
 # + text - The text
 # + target - The substring to replace (must not be empty)
 # + replacement - The replacement
+# + standaloneOnly - Whether to replace only occurrences that are not part of a longer word
 # + return - The text with every occurrence replaced
-isolated function replaceAllOccurrences(string text, string target, string replacement) returns string {
+isolated function replaceAllOccurrences(string text, string target, string replacement,
+        boolean standaloneOnly = false) returns string {
     string result = "";
     int startIndex = 0;
+    int searchIndex = 0;
     int? matchIndex = text.indexOf(target);
     while matchIndex is int {
-        result += text.substring(startIndex, matchIndex) + replacement;
-        startIndex = matchIndex + target.length();
-        matchIndex = text.indexOf(target, startIndex);
+        int matchEnd = matchIndex + target.length();
+        if !standaloneOnly || (!isWordCharAt(text, matchIndex - 1) && !isWordCharAt(text, matchEnd)) {
+            result += text.substring(startIndex, matchIndex) + replacement;
+            startIndex = matchEnd;
+            searchIndex = matchEnd;
+        } else {
+            searchIndex = matchIndex + 1;
+        }
+        matchIndex = text.indexOf(target, searchIndex);
     }
     return result + text.substring(startIndex);
+}
+
+# Checks whether the character at an index is a word character (a letter, digit, `_` or `-`).
+#
+# + text - The text
+# + index - The index; an index outside the text is not a word character
+# + return - `true` if the character is a word character
+isolated function isWordCharAt(string text, int index) returns boolean {
+    if index < 0 || index >= text.length() {
+        return false;
+    }
+    string:Char c = text[index];
+    return (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || (c >= "0" && c <= "9") || c == "_" || c == "-";
 }
 
 # Extracts a human-readable message from a provider error body (`{"error": {"message": ...}}`,
@@ -429,16 +486,13 @@ isolated function isFieldRejected(error err, string term) returns boolean =>
 #
 # + err - The error
 # + fieldName - The request field name
-# + matchParam - Whether a field named only in the error's `param` counts. When `false`, the field must be named in
-#                the error message itself, so that an error about the field's contents (which reports the field as
-#                its `param`) does not count as rejecting the field
 # + return - `true` if the server rejected the field as unsupported
-isolated function isUnsupportedFieldError(error err, string fieldName, boolean matchParam = true) returns boolean {
+isolated function isUnsupportedFieldError(error err, string fieldName) returns boolean {
     if !isRequestRejected(err) {
         return false;
     }
     string lowerFieldName = fieldName.toLowerAscii();
-    foreach string diagnostic in getProviderErrorDiagnostics(err, matchParam) {
+    foreach string diagnostic in getProviderErrorDiagnostics(err) {
         if !diagnostic.includes(lowerFieldName) {
             continue;
         }
