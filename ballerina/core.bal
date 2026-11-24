@@ -548,8 +548,9 @@ isolated function sendChatCompletion(http:Client llmClient, map<string> & readon
             && isUnsupportedFieldError(response, maxTokensField) {
         MaxTokensField alternative = maxTokensField == MAX_TOKENS ? MAX_COMPLETION_TOKENS : MAX_TOKENS;
         // Expected adaptation (e.g. OpenAI reasoning models only accept 'max_completion_tokens'); it is remembered,
-        // so it costs one extra request per provider instance. Logged at debug level for that reason.
-        log:printDebug(string `The server rejected '${maxTokensField}'; retrying with '${alternative}'. Set ` +
+        // so it costs one extra request per provider instance. Logged as a warning so that users see why the first
+        // request failed and how to avoid the extra request.
+        log:printWarn(string `The server rejected '${maxTokensField}'; retrying with '${alternative}'. Set ` +
                 string `'compatibility.maxTokensField' to skip this retry`);
         response = postJson(llmClient, CHAT_COMPLETIONS_PATH, headers,
                 buildChatBody(body, maxTokens, alternative, compatibility));

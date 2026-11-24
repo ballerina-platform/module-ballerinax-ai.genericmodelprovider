@@ -27,9 +27,9 @@ OpenAI-compatible servers differ in small ways. Instead of requiring provider-sp
 
 A fallback is used only when the server's error message names the rejected feature, and it is remembered for the
 lifetime of the provider instance only after the fallback request succeeds, so it costs at most one extra request.
-Remembered fallbacks are logged at the debug level because they are expected. To avoid the extra request, set the
-matching [compatibility](#compatibility-configuration) field (for example, `maxTokensField: MAX_COMPLETION_TOKENS` for
-OpenAI reasoning models such as `gpt-5`).
+The max-tokens fallback is logged as a warning; the other remembered fallbacks are logged at the debug level. To
+avoid the extra request, set the matching [compatibility](#compatibility-configuration) field (for example,
+`maxTokensField: MAX_COMPLETION_TOKENS` for OpenAI reasoning models such as `gpt-5`).
 
 ## Quickstart
 
