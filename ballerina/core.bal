@@ -22,7 +22,6 @@ const CHAT_COMPLETIONS_PATH = "/chat/completions";
 const PROVIDER_NAME = "openai-compatible";
 const MAX_REASONING_ENTRIES = 1000;
 const MAX_LOGGED_BODY_LENGTH = 1000;
-const MIN_REDACTED_CREDENTIAL_LENGTH = 8;
 const REDACTED_CREDENTIAL = "***";
 
 # Remembers request-shape fallbacks learned at runtime for a single provider instance, so that a
@@ -89,13 +88,22 @@ isolated class AdaptiveState {
 # Stores reasoning content returned with tool calls, keyed by `getReasoningKey`, so it can be sent back on the
 # corresponding assistant message in later turns (only used when `preserveReasoningContent` is enabled).
 # The store is bounded; the oldest entries are evicted once `MAX_REASONING_ENTRIES` is reached.
+# If two responses produce the same key with different reasoning (identical tool calls whose originating response
+# cannot be told apart), the key is marked ambiguous and no reasoning is returned for it, rather than reasoning that
+# may belong to another response.
 isolated class ReasoningStore {
-    private final map<string> reasoningByToolCall = {};
+    # Reasoning by key; `()` marks an ambiguous key
+    private final map<string?> reasoningByToolCall = {};
 
     isolated function put(string key, string reasoning) {
         lock {
-            if !self.reasoningByToolCall.hasKey(key)
-                    && self.reasoningByToolCall.length() >= MAX_REASONING_ENTRIES {
+            if self.reasoningByToolCall.hasKey(key) {
+                if self.reasoningByToolCall[key] != reasoning {
+                    self.reasoningByToolCall[key] = ();
+                }
+                return;
+            }
+            if self.reasoningByToolCall.length() >= MAX_REASONING_ENTRIES {
                 // Maps preserve insertion order, so the first key is the oldest entry.
                 string oldest = self.reasoningByToolCall.keys()[0];
                 _ = self.reasoningByToolCall.remove(oldest);
@@ -257,8 +265,8 @@ isolated function redactCredentials(string text, map<string> & readonly headers)
                 secret = secret.substring(schemeEnd + 1).trim();
             }
         }
-        // Very short values are not redacted, since replacing them could mangle unrelated text.
-        if secret.length() >= MIN_REDACTED_CREDENTIAL_LENGTH {
+        // Credentials of any length are redacted: leaking a short key is worse than masking unrelated text.
+        if secret != "" {
             redacted = replaceAllOccurrences(redacted, secret, REDACTED_CREDENTIAL);
         }
     }
@@ -366,8 +374,9 @@ isolated function getProviderErrorText(error err) returns string =>
 # Falls back to the raw body only when it is not JSON.
 #
 # + err - The error
+# + includeParam - Whether the `param` of the error object is part of its diagnostic
 # + return - The diagnostics in lower case
-isolated function getProviderErrorDiagnostics(error err) returns string[] {
+isolated function getProviderErrorDiagnostics(error err, boolean includeParam = true) returns string[] {
     string body = getErrorBody(err);
     json|error payload = body.fromJsonString();
     if payload is error {
@@ -383,7 +392,7 @@ isolated function getProviderErrorDiagnostics(error err) returns string[] {
         }
         foreach string key in ["message", "param", "code", "type"] {
             json value = errorSource[key];
-            if value is string|int {
+            if value is string|int && (includeParam || key != "param") {
                 parts.push(value.toString());
             }
         }
@@ -420,13 +429,16 @@ isolated function isFieldRejected(error err, string term) returns boolean =>
 #
 # + err - The error
 # + fieldName - The request field name
+# + matchParam - Whether a field named only in the error's `param` counts. When `false`, the field must be named in
+#                the error message itself, so that an error about the field's contents (which reports the field as
+#                its `param`) does not count as rejecting the field
 # + return - `true` if the server rejected the field as unsupported
-isolated function isUnsupportedFieldError(error err, string fieldName) returns boolean {
+isolated function isUnsupportedFieldError(error err, string fieldName, boolean matchParam = true) returns boolean {
     if !isRequestRejected(err) {
         return false;
     }
     string lowerFieldName = fieldName.toLowerAscii();
-    foreach string diagnostic in getProviderErrorDiagnostics(err) {
+    foreach string diagnostic in getProviderErrorDiagnostics(err, matchParam) {
         if !diagnostic.includes(lowerFieldName) {
             continue;
         }

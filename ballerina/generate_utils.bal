@@ -280,8 +280,11 @@ isolated function sendJsonSchemaRequest(GenerateRequestContext ctx) returns Gene
     };
     GenerateAttempt attempt = sendGenerateChatCompletion(ctx, [buildGenerateUserMessage(ctx)], fields);
     ChatCompletionResponse|ai:Error response = attempt.response;
-    if response is ai:Error && !isSchemaRejected(response) && (isUnsupportedFieldError(response, "response_format")
-            || isUnsupportedFieldError(response, "json_schema")) {
+    // The format or mode must be named in the error message itself: servers report errors about the schema contents
+    // with `param: response_format` too.
+    if response is ai:Error && !isSchemaRejected(response)
+            && (isUnsupportedFieldError(response, "response_format", matchParam = false)
+                || isUnsupportedFieldError(response, "json_schema", matchParam = false)) {
         log:printWarn(string `The server does not support 'response_format' of type 'json_schema' for model '${
                 ctx.modelType}'; retrying with 'json_object'`, statusCode = getStatusCode(response));
         return sendJsonObjectRequest(ctx, MAX_GENERATE_REQUESTS - 1);
@@ -535,8 +538,9 @@ type ParsedJson record {|
 |};
 
 # Extracts a JSON value from model text output. The intact text is parsed first, so that `<think>` tags inside JSON
-# string values are preserved. Otherwise, removes `<think>` blocks and markdown code fences, then tries the whole
-# text, followed by the first `{...}` or `[...]` span.
+# string values are preserved. Otherwise, removes the reasoning before the answer (leading `<think>` blocks) and
+# markdown code fences, then tries the whole text, followed by the first `{...}` or `[...]` span. Only if that fails
+# are `<think>` blocks elsewhere in the text removed as well.
 #
 # + text - The text output
 # + return - The extracted JSON value, or `()` if none could be found
@@ -549,12 +553,27 @@ isolated function extractJsonFromText(string text) returns ParsedJson? {
     if intact is json {
         return {value: intact};
     }
-    string cleaned = stripThinkBlocks(trimmed).trim();
-    if cleaned == "" {
+    // Only the reasoning before the answer is removed first, so that `<think>` tags inside the answer's JSON strings
+    // (including fenced JSON) are preserved.
+    string cleaned = stripLeadingThinkBlocks(trimmed);
+    ParsedJson? parsed = parseJsonCandidates(cleaned);
+    if parsed is ParsedJson {
+        return parsed;
+    }
+    string fullyCleaned = stripThinkBlocks(cleaned).trim();
+    return fullyCleaned == cleaned ? () : parseJsonCandidates(fullyCleaned);
+}
+
+# Parses JSON from text: the first code fence's content, then the whole text, then the first `{...}` or `[...]` span.
+#
+# + text - The text, without leading reasoning
+# + return - The parsed JSON value, or `()` if none could be found
+isolated function parseJsonCandidates(string text) returns ParsedJson? {
+    if text == "" {
         return ();
     }
-    string[] candidates = [cleaned];
-    string? fenced = extractCodeFenceContent(cleaned);
+    string[] candidates = [text];
+    string? fenced = extractCodeFenceContent(text);
     if fenced is string {
         candidates.unshift(fenced);
     }
@@ -571,6 +590,28 @@ isolated function extractJsonFromText(string text) returns ParsedJson? {
         }
     }
     return ();
+}
+
+# Removes the reasoning that precedes the answer: leading `<think>...</think>` blocks, or the text before a dangling
+# `</think>` that is not preceded by `<think>`. Tags later in the text are kept.
+#
+# + text - The text
+# + return - The text without the leading reasoning
+isolated function stripLeadingThinkBlocks(string text) returns string {
+    string result = text.trim();
+    while result.startsWith(THINK_START_TAG) {
+        int? endIndex = result.indexOf(THINK_END_TAG);
+        if endIndex is () {
+            return result;
+        }
+        result = result.substring(endIndex + THINK_END_TAG.length()).trim();
+    }
+    int? danglingEnd = result.indexOf(THINK_END_TAG);
+    int? startIndex = result.indexOf(THINK_START_TAG);
+    if danglingEnd is int && (startIndex is () || danglingEnd < startIndex) {
+        result = result.substring(danglingEnd + THINK_END_TAG.length()).trim();
+    }
+    return result;
 }
 
 # Removes `<think>...</think>` blocks from text. Text before a dangling `</think>` is removed as well.

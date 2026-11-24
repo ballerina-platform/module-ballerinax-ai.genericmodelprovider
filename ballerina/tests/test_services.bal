@@ -44,6 +44,7 @@ const MOCK_JSON_SCHEMA_ERROR = "Invalid parameter: 'response_format' of type 'js
 const MOCK_INVALID_SCHEMA_ERROR = "Invalid schema for response_format 'json_schema': In context=(), " +
         "'additionalProperties' is required to be supplied and to be false.";
 const MOCK_SCHEMA_KEYWORD_ERROR = "Invalid schema: patternProperties is not supported";
+const MOCK_BARE_KEYWORD_ERROR = "patternProperties is not supported";
 const MOCK_THINK_TAG_STRING = "a<think>b</think>c";
 const MOCK_NO_TOOLS_ERROR = "registry.ollama.ai/library/x does not support tools";
 const MOCK_NO_RESPONSE_FORMAT_ERROR = "Unrecognized request argument supplied: response_format";
@@ -188,6 +189,12 @@ isolated function mockHandleChatCompletion(string style, map<json> body, map<str
                 "param": "response_format",
                 "code": ()
             }
+        });
+    }
+    if style == "keywordschema" && responseFormatType == "json_schema" {
+        // A schema-keyword rejection without an "Invalid schema" prefix.
+        return mockJsonResponse(400, {
+            "error": {"param": "response_format", "message": MOCK_BARE_KEYWORD_ERROR}
         });
     }
     if style == "patternschema" && responseFormatType == "json_schema" {
@@ -392,7 +399,10 @@ isolated function mockHandleGenerate(string style, string model, string prompt, 
         : prompt.includes("GEN_BARE_NULL") ? "null" : payload.toJsonString();
 
     if style == "ollama" {
-        return mockTextResponse(style, model, "Sure! Here is the result:\n\n```json\n" + payloadText + "\n```\n");
+        // Reasoning models may emit draft JSON in a leading think block before the answer.
+        string reasoning = prompt.includes("GEN_THINK_PREFIX") ? "<think>Draft: {\"result\": 1}</think>\n" : "";
+        return mockTextResponse(style, model,
+                reasoning + "Sure! Here is the result:\n\n```json\n" + payloadText + "\n```\n");
     }
     boolean hasResultsTool = tools.some(tool => mockGetToolName(tool) == MOCK_GET_RESULTS_TOOL);
     if responseFormatType is string || !hasResultsTool {

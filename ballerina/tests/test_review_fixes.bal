@@ -18,6 +18,7 @@ import ballerina/ai;
 import ballerina/test;
 
 const STYLE_PATTERN_SCHEMA = "patternschema";
+const STYLE_KEYWORD_SCHEMA = "keywordschema";
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Credential redaction
@@ -48,6 +49,20 @@ function testRedactCredentialsCoversCredentialHeaders() {
     test:assertEquals(redacted, "a *** b *** c integration-tests ***");
 }
 
+@test:Config {groups: ["errors"]}
+function testShortCredentialIsRedacted() returns error? {
+    test:assertEquals(redactCredentials("bad key: k1", {"Authorization": "Bearer k1"}), "bad key: ***");
+
+    ModelProvider shortKeyProvider = check new (mockUrl(STANDARD), TEST_MODEL, "sk-7");
+    ai:ChatAssistantMessage|ai:Error result = shortKeyProvider->chat(
+            {role: ai:USER, content: "TRIGGER_ECHO_AUTH hello"});
+    if result !is ai:LlmConnectionError {
+        test:assertFail(string `Expected ai:LlmConnectionError, found: ${describe(result)}`);
+    }
+    test:assertFalse(result.toString().includes("sk-7"), "A short API key must not appear in the error");
+    test:assertFalse(getErrorBody(result).includes("sk-7"), "A short API key must not appear in the error body");
+}
+
 // ---------------------------------------------------------------------------------------------------------------------
 // Unsupported-field detection
 // ---------------------------------------------------------------------------------------------------------------------
@@ -74,6 +89,21 @@ function testUnsupportedFieldRequiresFieldAndReasonInSameDiagnostic() {
             body = openAiStyle.toJsonString());
     test:assertTrue(isUnsupportedFieldError(openAiErr, "max_tokens"),
             "The message and param of one error object form a single diagnostic");
+}
+
+@test:Config {groups: ["adaptive"]}
+function testJsonSchemaBareKeywordRejectionDoesNotFallBack() returns error? {
+    ModelProvider schemaProvider = check new (mockUrl(STYLE_KEYWORD_SCHEMA), TEST_MODEL, TEST_API_KEY,
+            compatibility = {structuredOutputMode: JSON_SCHEMA});
+    int initialCount = getRequestCount(STYLE_KEYWORD_SCHEMA);
+    Review|error result = schemaProvider->generate(`GEN_REVIEW Please review this blog: ${blog2.title}`);
+    if result !is ai:LlmConnectionError {
+        test:assertFail(string `Expected ai:LlmConnectionError, found: ${describe(result)}`);
+    }
+    test:assertTrue(result.message().includes(MOCK_BARE_KEYWORD_ERROR),
+            string `The schema error must propagate, found: ${result.message()}`);
+    test:assertEquals(getRequestCount(STYLE_KEYWORD_SCHEMA), initialCount + 1,
+            "An error that names response_format only as its param must not trigger the json_object fallback");
 }
 
 @test:Config {groups: ["adaptive"]}
@@ -130,6 +160,26 @@ function testAutoToolChoiceFallbackIsNotRememberedAfterEmptyRetry() returns erro
 function testGeneratePreservesThinkTagsInsideJsonStrings() returns error? {
     string result = check provider->generate(`GEN_THINK_STRING Say something`);
     test:assertEquals(result, MOCK_THINK_TAG_STRING);
+}
+
+@test:Config {groups: ["generate"]}
+function testGeneratePreservesThinkTagsInsideFencedJson() returns error? {
+    ModelProvider ollamaProvider = check new (mockUrl(OLLAMA), "llama3.2");
+    string result = check ollamaProvider->generate(`GEN_THINK_STRING Say something`);
+    test:assertEquals(result, MOCK_THINK_TAG_STRING);
+}
+
+@test:Config {groups: ["generate"]}
+function testGenerateIgnoresDraftJsonInLeadingThinkBlock() returns error? {
+    ModelProvider ollamaProvider = check new (mockUrl(OLLAMA), "llama3.2");
+    int result = check ollamaProvider->generate(`GEN_INT GEN_THINK_PREFIX What is 1 + 1?`);
+    test:assertEquals(result, 2);
+}
+
+@test:Config {groups: ["generate"]}
+function testExtractJsonFromTextFallsBackToRemovingAllThinkBlocks() {
+    ParsedJson? parsed = extractJsonFromText("Answer: <think>maybe {broken</think> {\"a\": 1}");
+    test:assertEquals(parsed, {value: {"a": 1}});
 }
 
 @test:Config {groups: ["generate"]}
@@ -218,3 +268,39 @@ function toolCallChoice(string id, string arguments, string reasoning) returns j
 function toChoice(json choice) returns ChatChoice|error => choice.cloneWithType();
 
 function asMap(json value) returns map<json>|error => value.ensureType();
+
+@test:Config {groups: ["chat"]}
+function testIdenticalToolCallsWithDifferentReasoningOmitReasoning() returns error? {
+    foreach string? id in ["call_0", ()] {
+        ReasoningStore store = new;
+        ai:ChatAssistantMessage first = check convertToAssistantMessage(check toChoice(
+                toolCallChoiceWithId(id, "{\"city\":\"Colombo\"}", "Reasoning of conversation A")), store);
+        ai:ChatAssistantMessage second = check convertToAssistantMessage(check toChoice(
+                toolCallChoiceWithId(id, "{\"city\":\"Colombo\"}", "Reasoning of conversation B")), store);
+
+        json[] requestA = check buildChatRequestMessages([{role: ai:USER, content: "A"}, first], SYSTEM, store);
+        json[] requestB = check buildChatRequestMessages([{role: ai:USER, content: "B"}, second], SYSTEM, store);
+        test:assertFalse((check asMap(requestA[1])).hasKey("reasoning_content"),
+                "Reasoning must be omitted when its response cannot be identified");
+        test:assertFalse((check asMap(requestB[1])).hasKey("reasoning_content"),
+                "Reasoning must be omitted when its response cannot be identified");
+    }
+}
+
+@test:Config {groups: ["chat"]}
+function testIdenticalToolCallsWithSameReasoningKeepReasoning() returns error? {
+    ReasoningStore store = new;
+    ai:ChatAssistantMessage first = check convertToAssistantMessage(check toChoice(
+            toolCallChoiceWithId((), "{}", MOCK_REASONING_TEXT)), store);
+    _ = check convertToAssistantMessage(check toChoice(toolCallChoiceWithId((), "{}", MOCK_REASONING_TEXT)), store);
+    json[] request = check buildChatRequestMessages([{role: ai:USER, content: "A"}, first], SYSTEM, store);
+    test:assertEquals((check asMap(request[1]))["reasoning_content"], MOCK_REASONING_TEXT);
+}
+
+function toolCallChoiceWithId(string? id, string arguments, string reasoning) returns json => {
+    "message": {
+        "role": "assistant",
+        "reasoning_content": reasoning,
+        "tool_calls": [{"id": id, "type": "function", "function": {"name": "getWeather", "arguments": arguments}}]
+    }
+};
