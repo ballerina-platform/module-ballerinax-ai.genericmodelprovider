@@ -22,6 +22,8 @@ const CHAT_COMPLETIONS_PATH = "/chat/completions";
 const PROVIDER_NAME = "openai-compatible";
 const MAX_REASONING_ENTRIES = 1000;
 const MAX_LOGGED_BODY_LENGTH = 1000;
+const MIN_REDACTED_CREDENTIAL_LENGTH = 8;
+const REDACTED_CREDENTIAL = "***";
 
 # Remembers request-shape fallbacks learned at runtime for a single provider instance, so that a
 # rejected optional feature is retried only once per provider instance.
@@ -84,27 +86,27 @@ isolated class AdaptiveState {
     }
 }
 
-# Stores reasoning content returned with tool calls, keyed by tool call ID, so it can be sent back on the
+# Stores reasoning content returned with tool calls, keyed by `getReasoningKey`, so it can be sent back on the
 # corresponding assistant message in later turns (only used when `preserveReasoningContent` is enabled).
 # The store is bounded; the oldest entries are evicted once `MAX_REASONING_ENTRIES` is reached.
 isolated class ReasoningStore {
-    private final map<string> reasoningByToolCallId = {};
+    private final map<string> reasoningByToolCall = {};
 
-    isolated function put(string toolCallId, string reasoning) {
+    isolated function put(string key, string reasoning) {
         lock {
-            if !self.reasoningByToolCallId.hasKey(toolCallId)
-                    && self.reasoningByToolCallId.length() >= MAX_REASONING_ENTRIES {
+            if !self.reasoningByToolCall.hasKey(key)
+                    && self.reasoningByToolCall.length() >= MAX_REASONING_ENTRIES {
                 // Maps preserve insertion order, so the first key is the oldest entry.
-                string oldest = self.reasoningByToolCallId.keys()[0];
-                _ = self.reasoningByToolCallId.remove(oldest);
+                string oldest = self.reasoningByToolCall.keys()[0];
+                _ = self.reasoningByToolCall.remove(oldest);
             }
-            self.reasoningByToolCallId[toolCallId] = reasoning;
+            self.reasoningByToolCall[key] = reasoning;
         }
     }
 
-    isolated function get(string toolCallId) returns string? {
+    isolated function get(string key) returns string? {
         lock {
-            return self.reasoningByToolCallId[toolCallId];
+            return self.reasoningByToolCall[key];
         }
     }
 }
@@ -144,8 +146,7 @@ isolated function createHttpClient(string serviceUrl, ConnectionConfig connectio
         poolConfig: connectionConfig.poolConfig,
         compression: connectionConfig.compression,
         circuitBreaker: connectionConfig.circuitBreaker,
-        retryConfig: connectionConfig.retryConfig,
-        validation: connectionConfig.validation
+        retryConfig: connectionConfig.retryConfig
     };
     http:ClientHttp1Settings? http1Settings = connectionConfig.http1Settings;
     if http1Settings is http:ClientHttp1Settings {
@@ -216,7 +217,8 @@ isolated function postJson(http:Client llmClient, string path, map<string> & rea
     int statusCode = response.statusCode;
     if statusCode >= 300 {
         string|http:ClientError textPayload = response.getTextPayload();
-        string responseBody = (textPayload is string) ? textPayload : "";
+        // Some gateways echo the request credentials in error responses; never return or log them.
+        string responseBody = redactCredentials((textPayload is string) ? textPayload : "", headers);
         string message = string `Error while connecting to the model: HTTP ${statusCode}`;
         string? providerMessage = extractProviderErrorMessage(responseBody);
         if providerMessage is string {
@@ -233,6 +235,66 @@ isolated function postJson(http:Client llmClient, string path, map<string> & rea
                 "Invalid response received from the model: the response is not valid JSON", payload);
     }
     return payload;
+}
+
+# Replaces the credentials sent in the request headers (the `Authorization` header and any header whose name suggests
+# a secret, such as an API key or token) with a placeholder.
+#
+# + text - The text to redact
+# + headers - The request headers
+# + return - The redacted text
+isolated function redactCredentials(string text, map<string> & readonly headers) returns string {
+    string redacted = text;
+    foreach [string, string] [name, value] in headers.entries() {
+        if !isCredentialHeader(name) {
+            continue;
+        }
+        string secret = value.trim();
+        int? schemeEnd = secret.indexOf(" ");
+        if schemeEnd is int {
+            string scheme = secret.substring(0, schemeEnd).toLowerAscii();
+            if scheme == "bearer" || scheme == "basic" {
+                secret = secret.substring(schemeEnd + 1).trim();
+            }
+        }
+        // Very short values are not redacted, since replacing them could mangle unrelated text.
+        if secret.length() >= MIN_REDACTED_CREDENTIAL_LENGTH {
+            redacted = replaceAllOccurrences(redacted, secret, REDACTED_CREDENTIAL);
+        }
+    }
+    return redacted;
+}
+
+# Checks whether a header name suggests that the header carries a credential.
+#
+# + name - The header name
+# + return - `true` if the header likely carries a credential
+isolated function isCredentialHeader(string name) returns boolean {
+    string lowerName = name.toLowerAscii();
+    foreach string marker in ["auth", "key", "token", "secret", "cookie", "password"] {
+        if lowerName.includes(marker) {
+            return true;
+        }
+    }
+    return false;
+}
+
+# Replaces every occurrence of a literal substring.
+#
+# + text - The text
+# + target - The substring to replace (must not be empty)
+# + replacement - The replacement
+# + return - The text with every occurrence replaced
+isolated function replaceAllOccurrences(string text, string target, string replacement) returns string {
+    string result = "";
+    int startIndex = 0;
+    int? matchIndex = text.indexOf(target);
+    while matchIndex is int {
+        result += text.substring(startIndex, matchIndex) + replacement;
+        startIndex = matchIndex + target.length();
+        matchIndex = text.indexOf(target, startIndex);
+    }
+    return result + text.substring(startIndex);
 }
 
 # Extracts a human-readable message from a provider error body (`{"error": {"message": ...}}`,
@@ -296,16 +358,26 @@ isolated function isRequestRejected(error err) returns boolean {
 #
 # + err - The error
 # + return - The provider error text in lower case
-isolated function getProviderErrorText(error err) returns string {
+isolated function getProviderErrorText(error err) returns string =>
+    string:'join(" ", ...getProviderErrorDiagnostics(err));
+
+# Returns the individual diagnostics of the provider's error body, each in lower case. The error object (its message,
+# param, code and type) is one diagnostic, and each FastAPI/pydantic validation error is a separate diagnostic.
+# Falls back to the raw body only when it is not JSON.
+#
+# + err - The error
+# + return - The diagnostics in lower case
+isolated function getProviderErrorDiagnostics(error err) returns string[] {
     string body = getErrorBody(err);
     json|error payload = body.fromJsonString();
     if payload is error {
-        return truncate(body, MAX_LOGGED_BODY_LENGTH).toLowerAscii();
+        return [truncate(body, MAX_LOGGED_BODY_LENGTH).toLowerAscii()];
     }
-    string[] parts = [];
+    string[] diagnostics = [];
     if payload is map<json> {
         json errorField = payload["error"];
         map<json> errorSource = (errorField is map<json>) ? errorField : payload;
+        string[] parts = [];
         if errorField is string {
             parts.push(errorField);
         }
@@ -315,19 +387,23 @@ isolated function getProviderErrorText(error err) returns string {
                 parts.push(value.toString());
             }
         }
+        if parts.length() > 0 {
+            diagnostics.push(string:'join(" ", ...parts));
+        }
         json detail = payload["detail"];
         if detail is string {
-            parts.push(detail);
+            diagnostics.push(detail);
         } else if detail is json[] {
             // FastAPI/pydantic validation errors: use only `loc` and `msg`, not the echoed `input`.
             foreach json item in detail {
                 if item is map<json> {
-                    parts.push(item["loc"].toString(), item["msg"].toString());
+                    diagnostics.push(string `${item["loc"].toString()} ${item["msg"].toString()}`);
                 }
             }
         }
     }
-    return string:'join(" ", ...parts).toLowerAscii();
+    return from string diagnostic in diagnostics
+        select diagnostic.toLowerAscii();
 }
 
 # Checks whether an error is a request rejection whose provider error text mentions the given term.
@@ -339,23 +415,41 @@ isolated function isFieldRejected(error err, string term) returns boolean =>
     isRequestRejected(err) && getProviderErrorText(err).includes(term.toLowerAscii());
 
 # Checks whether an error is a request rejection stating that the given field is unsupported or unknown
-# (as opposed to having an invalid value).
+# (as opposed to having an invalid value). The field and the rejection reason must appear in the same diagnostic, so
+# that an unrelated diagnostic (e.g. another field that is not permitted) does not count as rejecting the field.
 #
 # + err - The error
 # + fieldName - The request field name
 # + return - `true` if the server rejected the field as unsupported
 isolated function isUnsupportedFieldError(error err, string fieldName) returns boolean {
-    if !isFieldRejected(err, fieldName) {
+    if !isRequestRejected(err) {
         return false;
     }
-    string text = getProviderErrorText(err);
-    foreach string marker in ["unsupported", "not supported", "unknown", "unrecognized", "not allowed",
-            "not permitted", "extra", "instead", "invalid parameter", "unexpected"] {
-        if text.includes(marker) {
-            return true;
+    string lowerFieldName = fieldName.toLowerAscii();
+    foreach string diagnostic in getProviderErrorDiagnostics(err) {
+        if !diagnostic.includes(lowerFieldName) {
+            continue;
+        }
+        foreach string marker in ["unsupported", "not supported", "unknown", "unrecognized", "not allowed",
+                "not permitted", "extra", "instead", "invalid parameter", "unexpected"] {
+            if diagnostic.includes(marker) {
+                return true;
+            }
         }
     }
     return false;
+}
+
+# Checks whether a response contains at least one choice, i.e. whether it is usable as a chat completion.
+#
+# + response - The JSON response
+# + return - `true` if the response has a non-empty `choices` array
+isolated function hasChoices(json response) returns boolean {
+    if response !is map<json> {
+        return false;
+    }
+    json choices = response["choices"];
+    return choices is json[] && choices.length() > 0;
 }
 
 # Truncates a string to the given length.
@@ -393,7 +487,8 @@ isolated function sendChatCompletion(http:Client llmClient, map<string> & readon
                 string `'compatibility.maxTokensField' to skip this retry`);
         response = postJson(llmClient, CHAT_COMPLETIONS_PATH, headers,
                 buildChatBody(body, maxTokens, alternative, compatibility));
-        if response is json {
+        if response is json && hasChoices(response) {
+            // Remember the alternative only after a usable completion, so an empty retry does not change the field.
             adaptiveState.setMaxTokensField(alternative);
         }
     }

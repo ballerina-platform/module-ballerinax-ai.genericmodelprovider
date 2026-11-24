@@ -43,6 +43,8 @@ const MOCK_JSON_SCHEMA_ERROR = "Invalid parameter: 'response_format' of type 'js
         "with this model.";
 const MOCK_INVALID_SCHEMA_ERROR = "Invalid schema for response_format 'json_schema': In context=(), " +
         "'additionalProperties' is required to be supplied and to be false.";
+const MOCK_SCHEMA_KEYWORD_ERROR = "Invalid schema: patternProperties is not supported";
+const MOCK_THINK_TAG_STRING = "a<think>b</think>c";
 const MOCK_NO_TOOLS_ERROR = "registry.ollama.ai/library/x does not support tools";
 const MOCK_NO_RESPONSE_FORMAT_ERROR = "Unrecognized request argument supplied: response_format";
 const MOCK_CONTEXT_LENGTH_ERROR = "Request too large: context length exceeded (8192 tokens).";
@@ -188,6 +190,15 @@ isolated function mockHandleChatCompletion(string style, map<json> body, map<str
             }
         });
     }
+    if style == "patternschema" && responseFormatType == "json_schema" {
+        return mockJsonResponse(400, {
+            "error": {
+                "message": MOCK_SCHEMA_KEYWORD_ERROR,
+                "type": "invalid_request_error",
+                "param": "response_format"
+            }
+        });
+    }
     if (style == "notools" || style == "bare") && body.hasKey("tools") {
         return mockErrorResponse(400, MOCK_NO_TOOLS_ERROR);
     }
@@ -211,6 +222,10 @@ isolated function mockHandleChatCompletion(string style, map<json> body, map<str
         return mockJsonResponse(400, {
             "error": {"message": MOCK_CONTEXT_LENGTH_ERROR, "type": "invalid_request_error", "code": "context_length"}
         });
+    }
+    if prompt.includes("TRIGGER_ECHO_AUTH") {
+        // Simulates a gateway that echoes the received credential in its error response.
+        return mockErrorResponse(401, string `Invalid credential: ${headers["authorization"] ?: ""}`);
     }
     int? triggeredStatus = mockGetTriggeredStatus(prompt);
     if triggeredStatus is int {
@@ -373,7 +388,8 @@ isolated function mockHandleGenerate(string style, string model, string prompt, 
     json value = mockGetGenerateValue(prompt);
     map<json>? schema = mockGetResultSchema(tools, responseFormat);
     json payload = mockWrapGenerateValue(value, schema);
-    string payloadText = prompt.includes("GEN_MALFORMED") ? "this is not json" : payload.toJsonString();
+    string payloadText = prompt.includes("GEN_MALFORMED") ? "this is not json"
+        : prompt.includes("GEN_BARE_NULL") ? "null" : payload.toJsonString();
 
     if style == "ollama" {
         return mockTextResponse(style, model, "Sure! Here is the result:\n\n```json\n" + payloadText + "\n```\n");
@@ -399,6 +415,9 @@ isolated function mockGetGenerateValue(string prompt) returns json {
     }
     if prompt.includes("GEN_INT") {
         return 2;
+    }
+    if prompt.includes("GEN_THINK_STRING") {
+        return MOCK_THINK_TAG_STRING;
     }
     if prompt.includes("GEN_STRING") {
         return MOCK_STRING_RESULT;

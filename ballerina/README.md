@@ -78,6 +78,7 @@ type Summary record {|
     string[] keyPoints;
 |};
 
+string text = "Ballerina is an open-source programming language for writing network-aware integrations.";
 Summary summary = check model->generate(`Summarize the following text: ${text}`);
 ```
 

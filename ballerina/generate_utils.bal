@@ -219,7 +219,7 @@ isolated function sendToolCallRequest(GenerateRequestContext ctx) returns Genera
         requestsSent += 1;
         attempt = sendToolCallRequestWithMode(ctx, AUTO);
         response = attempt.response;
-        if response is ChatCompletionResponse {
+        if isUsableResponse(response) {
             // Remember the fallback only when it worked, so unrelated errors do not change the mode.
             ctx.adaptiveState.markForcedToolChoiceRejected();
         }
@@ -230,7 +230,7 @@ isolated function sendToolCallRequest(GenerateRequestContext ctx) returns Genera
                 "falling back to the JSON object strategy. Set 'compatibility.structuredOutputMode' to " +
                 "'JSON_OBJECT' to skip this retry", statusCode = getStatusCode(response));
         GenerateAttempt fallback = sendJsonObjectRequest(ctx, MAX_GENERATE_REQUESTS - requestsSent);
-        if fallback.response is ChatCompletionResponse {
+        if isUsableResponse(fallback.response) {
             ctx.adaptiveState.markToolsRejected();
         }
         return fallback;
@@ -280,7 +280,7 @@ isolated function sendJsonSchemaRequest(GenerateRequestContext ctx) returns Gene
     };
     GenerateAttempt attempt = sendGenerateChatCompletion(ctx, [buildGenerateUserMessage(ctx)], fields);
     ChatCompletionResponse|ai:Error response = attempt.response;
-    if response is ai:Error && (isUnsupportedFieldError(response, "response_format")
+    if response is ai:Error && !isSchemaRejected(response) && (isUnsupportedFieldError(response, "response_format")
             || isUnsupportedFieldError(response, "json_schema")) {
         log:printWarn(string `The server does not support 'response_format' of type 'json_schema' for model '${
                 ctx.modelType}'; retrying with 'json_object'`, statusCode = getStatusCode(response));
@@ -311,12 +311,40 @@ isolated function sendJsonObjectRequest(GenerateRequestContext ctx, int maxReque
         log:printDebug(string `The server rejected 'response_format' of type 'json_object' for model '${
                 ctx.modelType}'; retrying without 'response_format'`, statusCode = getStatusCode(response));
         GenerateAttempt retryAttempt = sendGenerateChatCompletion(ctx, messages, {});
-        if retryAttempt.response is ChatCompletionResponse {
+        if isUsableResponse(retryAttempt.response) {
             ctx.adaptiveState.markJsonObjectRejected();
         }
         return retryAttempt;
     }
     return attempt;
+}
+
+# Checks whether a response is usable, i.e. it is a chat completion with at least one choice. A fallback is
+# remembered only when it produces a usable response.
+#
+# + response - The response, or its error
+# + return - `true` if the response has at least one choice
+isolated function isUsableResponse(ChatCompletionResponse|ai:Error response) returns boolean =>
+    response is ChatCompletionResponse && getFirstChoice(response) is ChatChoice;
+
+# Checks whether the server rejected the contents of the JSON schema (e.g. a schema keyword it does not support),
+# rather than the `json_schema` response format itself. Such errors must not fall back to a mode that does not
+# enforce the schema.
+#
+# + err - The error
+# + return - `true` if the error identifies a rejected schema
+isolated function isSchemaRejected(error err) returns boolean {
+    if !isRequestRejected(err) {
+        return false;
+    }
+    string text = getProviderErrorText(err);
+    foreach string marker in ["invalid schema", "invalid json schema", "schema is invalid", "schema contains",
+            "schema keyword", "unsupported keyword"] {
+        if text.includes(marker) {
+            return true;
+        }
+    }
+    return false;
 }
 
 # Builds the request body and sends it via `sendChatCompletion`.
@@ -363,11 +391,13 @@ isolated function buildGenerateSystemMessage(GenerateRequestContext ctx, string 
 };
 
 # Wraps a non-object schema under a `result` property so it can be used as tool parameters or a JSON object.
+# Root-level definitions (`$defs`, `definitions`) stay on the wrapper, so root-relative `$ref`s remain valid.
 #
 # + schema - The original schema
 # + return - The (possibly wrapped) response schema
 isolated function generateJsonObjectSchema(map<json> schema) returns ResponseSchema {
-    string[] supportedMetaDataFields = ["$schema", "$id", "$anchor", "$comment", "title", "description"];
+    string[] supportedMetaDataFields = ["$schema", "$id", "$anchor", "$comment", "title", "description", "$defs",
+        "definitions"];
 
     if schema["type"] == "object" {
         return {schema};
@@ -427,9 +457,9 @@ isolated function extractGenerateOutput(ChatChoice choice, ResponseSchema respon
     if toolCall is ToolCallFunction {
         json arguments = toolCall?.arguments;
         if arguments is string {
-            json? parsed = extractJsonFromText(arguments);
-            if parsed !is () {
-                return parsed;
+            ParsedJson? parsed = extractJsonFromText(arguments);
+            if parsed is ParsedJson {
+                return parsed.value;
             }
         } else if arguments !is () {
             return arguments;
@@ -438,15 +468,17 @@ isolated function extractGenerateOutput(ChatChoice choice, ResponseSchema respon
 
     string? text = getResponseText(message);
     if text is string && text.trim() != "" {
-        json? parsed = extractJsonFromText(text);
+        ParsedJson? parsed = extractJsonFromText(text);
+        json parsedValue = parsed?.value;
         // When a string is expected, a plain text answer is usable as is. This also covers text that happens to
         // parse as a non-string scalar or `null` (e.g. `42`, `true`), which must stay a string.
-        if isWrappedStringSchema(responseSchema) && (parsed is () || parsed is boolean|int|float|decimal) {
+        if isWrappedStringSchema(responseSchema) && (parsed is () || parsedValue is ()|boolean|int|float|decimal) {
             string cleaned = stripThinkBlocks(text).trim();
             return extractCodeFenceContent(cleaned) ?: cleaned;
         }
-        if parsed !is () {
-            return parsed;
+        if parsed is ParsedJson {
+            // A parsed JSON `null` is returned as is, so that it can be converted to a nilable expected type.
+            return parsed.value;
         }
     }
 
@@ -495,13 +527,29 @@ isolated function isWrappedStringSchema(ResponseSchema responseSchema) returns b
     return inner is map<json> && inner["type"] == "string";
 }
 
-# Extracts a JSON value from model text output. Removes `<think>` blocks and markdown code fences, then tries the
-# whole text, followed by the first `{...}` or `[...]` span.
+# A JSON value successfully parsed from text. Wrapping the value distinguishes a parsed JSON `null` from a
+# parse failure.
+type ParsedJson record {|
+    # The parsed value
+    json value;
+|};
+
+# Extracts a JSON value from model text output. The intact text is parsed first, so that `<think>` tags inside JSON
+# string values are preserved. Otherwise, removes `<think>` blocks and markdown code fences, then tries the whole
+# text, followed by the first `{...}` or `[...]` span.
 #
 # + text - The text output
 # + return - The extracted JSON value, or `()` if none could be found
-isolated function extractJsonFromText(string text) returns json? {
-    string cleaned = stripThinkBlocks(text).trim();
+isolated function extractJsonFromText(string text) returns ParsedJson? {
+    string trimmed = text.trim();
+    if trimmed == "" {
+        return ();
+    }
+    json|error intact = trimmed.fromJsonString();
+    if intact is json {
+        return {value: intact};
+    }
+    string cleaned = stripThinkBlocks(trimmed).trim();
     if cleaned == "" {
         return ();
     }
@@ -513,13 +561,13 @@ isolated function extractJsonFromText(string text) returns json? {
     foreach string candidate in candidates {
         json|error parsed = candidate.fromJsonString();
         if parsed is json {
-            return parsed;
+            return {value: parsed};
         }
     }
     foreach string candidate in candidates {
         json? parsed = extractJsonSpan(candidate);
         if parsed !is () {
-            return parsed;
+            return {value: parsed};
         }
     }
     return ();

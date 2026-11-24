@@ -72,10 +72,6 @@ public type ConnectionConfig record {|
     # Proxy server related options
     @display {label: "Proxy Configuration"}
     http:ProxyConfig proxy?;
-
-    # Enables the inbound payload validation functionality which provided by the constraint package. Enabled by default
-    @display {label: "Payload Validation"}
-    boolean validation = true;
 |};
 
 # Name of the request field used to send the maximum number of tokens to generate.

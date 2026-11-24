@@ -15,6 +15,7 @@
 // under the License.
 
 import ballerina/ai;
+import ballerina/crypto;
 
 const MALFORMED_TOOL_CALL_ARGUMENTS_ERROR = "Invalid or malformed arguments received in function call response.";
 const THINK_START_TAG = "<think>";
@@ -29,7 +30,7 @@ const THINK_END_TAG = "</think>";
 isolated function buildChatRequestMessages(ai:ChatMessage[]|ai:ChatUserMessage messages, SystemRole systemRole,
         ReasoningStore? reasoningStore) returns json[]|ai:Error {
     ai:ChatMessage[] chatMessages = (messages is ai:ChatUserMessage) ? [messages] : messages;
-    ToolCallIdTracker idTracker = {};
+    ToolCallIdTracker idTracker = {reservedIds: collectExplicitToolCallIds(chatMessages)};
     json[] requestMessages = [];
     foreach ai:ChatMessage message in chatMessages {
         if message is ai:ChatUserMessage {
@@ -60,7 +61,34 @@ type ToolCallIdTracker record {|
     map<int> resultCounts = {};
     # Per-tool-name IDs of tool calls that have not been answered yet, in call order
     map<string[]> unansweredCalls = {};
+    # IDs that fallback IDs must not reuse: the explicit IDs in the transcript and the fallback IDs already generated
+    map<()> reservedIds = {};
 |};
+
+# Collects the explicit tool call IDs of all assistant and tool result messages, so that generated fallback IDs never
+# collide with them.
+#
+# + messages - The chat messages
+# + return - The explicit IDs
+isolated function collectExplicitToolCallIds(ai:ChatMessage[] messages) returns map<()> {
+    map<()> ids = {};
+    foreach ai:ChatMessage message in messages {
+        if message is ai:ChatAssistantMessage {
+            foreach ai:FunctionCall toolCall in message.toolCalls ?: [] {
+                string? id = normalizeToolCallId(toolCall?.id);
+                if id is string {
+                    ids[id] = ();
+                }
+            }
+        } else if message is ai:ChatFunctionMessage {
+            string? id = normalizeToolCallId(message?.id);
+            if id is string {
+                ids[id] = ();
+            }
+        }
+    }
+    return ids;
+}
 
 # Builds an assistant request message, including its tool calls and, when available, its reasoning content.
 #
@@ -81,16 +109,15 @@ isolated function buildAssistantRequestMessage(ai:ChatAssistantMessage message, 
     }
 
     json[] requestToolCalls = [];
-    string[] toolCallIds = [];
     foreach ai:FunctionCall toolCall in toolCalls {
-        string id = normalizeToolCallId(toolCall?.id) ?: nextToolCallId(toolCall.name, idTracker.callCounts);
+        string id = normalizeToolCallId(toolCall?.id)
+            ?: nextToolCallId(toolCall.name, idTracker.callCounts, idTracker.reservedIds);
         string[]? unanswered = idTracker.unansweredCalls[toolCall.name];
         if unanswered is string[] {
             unanswered.push(id);
         } else {
             idTracker.unansweredCalls[toolCall.name] = [id];
         }
-        toolCallIds.push(id);
         requestToolCalls.push({
             id,
             'type: "function",
@@ -103,7 +130,9 @@ isolated function buildAssistantRequestMessage(ai:ChatAssistantMessage message, 
     requestMessage["tool_calls"] = requestToolCalls;
 
     if reasoningStore is ReasoningStore {
-        string? reasoning = reasoningStore.get(toolCallIds[0]);
+        // Agents may split a response with parallel tool calls into one assistant message per call, so the reasoning
+        // is looked up by the first tool call of this message.
+        string? reasoning = reasoningStore.get(getReasoningKey(toolCalls[0]));
         if reasoning is string {
             requestMessage["reasoning_content"] = reasoning;
         }
@@ -133,7 +162,7 @@ isolated function resolveToolResultId(string name, string? id, ToolCallIdTracker
     if unanswered is string[] && unanswered.length() > 0 {
         return unanswered.shift();
     }
-    return nextToolCallId(name, idTracker.resultCounts);
+    return nextToolCallId(name, idTracker.resultCounts, idTracker.reservedIds);
 }
 
 # Returns the tool call ID, treating a blank ID as missing.
@@ -142,15 +171,38 @@ isolated function resolveToolResultId(string name, string? id, ToolCallIdTracker
 # + return - The ID, or `()` if it is missing or blank
 isolated function normalizeToolCallId(string? id) returns string? => id is string && id.trim() != "" ? id : ();
 
-# Generates a deterministic fallback tool call ID (`call_<name>_<n>`) for the nth occurrence of a tool name.
+# Generates a deterministic fallback tool call ID (`call_<name>_<n>`) for the nth occurrence of a tool name,
+# skipping IDs that are already reserved. The generated ID is reserved as well.
 #
 # + name - The tool name
 # + counts - Per-tool-name occurrence counters, updated in place
+# + reservedIds - IDs that must not be generated, updated in place
 # + return - The generated ID
-isolated function nextToolCallId(string name, map<int> counts) returns string {
-    int occurrence = (counts[name] ?: 0) + 1;
+isolated function nextToolCallId(string name, map<int> counts, map<()> reservedIds) returns string {
+    int occurrence = counts[name] ?: 0;
+    string id;
+    while true {
+        occurrence += 1;
+        id = string `call_${name}_${occurrence}`;
+        if !reservedIds.hasKey(id) {
+            break;
+        }
+    }
     counts[name] = occurrence;
-    return string `call_${name}_${occurrence}`;
+    reservedIds[id] = ();
+    return id;
+}
+
+# Returns the key under which the reasoning of a tool call is stored: a hash of the tool call's ID (when the server
+# returned one), name and arguments. Keying by the whole tool call, rather than by the ID alone, keeps a server that
+# reuses tool call IDs from attaching one response's reasoning to another response's tool call, and also allows
+# reasoning to be replayed for tool calls without an ID.
+#
+# + toolCall - The tool call
+# + return - The reasoning key
+isolated function getReasoningKey(ai:FunctionCall toolCall) returns string {
+    json identity = [normalizeToolCallId(toolCall?.id), toolCall.name, toolCall.arguments ?: {}];
+    return crypto:hashSha256(identity.toJsonString().toBytes()).toBase16();
 }
 
 # Builds the `tools` array of a Chat Completions request.
@@ -171,7 +223,7 @@ isolated function buildChatRequestTools(ai:ChatCompletionFunctions[] tools) retu
 # Converts a chat completion choice into an assistant message.
 #
 # + choice - The chat completion choice
-# + reasoningStore - Store in which reasoning content is saved against the returned tool call IDs, if enabled
+# + reasoningStore - Store in which reasoning content is saved against the returned tool calls, if enabled
 # + return - The assistant message, or an `ai:Error` if the response is invalid
 isolated function convertToAssistantMessage(ChatChoice choice, ReasoningStore? reasoningStore)
         returns ai:ChatAssistantMessage|ai:Error {
@@ -224,10 +276,7 @@ isolated function convertToAssistantMessage(ChatChoice choice, ReasoningStore? r
         string? reasoning = getReasoningContent(message) ?: thinkReasoning;
         if reasoning is string {
             foreach ai:FunctionCall functionCall in functionCalls {
-                string? id = functionCall?.id;
-                if id is string {
-                    reasoningStore.put(id, reasoning);
-                }
+                reasoningStore.put(getReasoningKey(functionCall), reasoning);
             }
         }
     }
