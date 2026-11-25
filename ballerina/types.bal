@@ -146,8 +146,11 @@ public type CompatibilityConfig record {|
     @display {label: "Fields to Drop"}
     string[] dropParams = [];
 
-    # Whether to send the model's reasoning content back on assistant tool-call messages in subsequent turns.
-    # Required by some thinking models (e.g. DeepSeek thinking mode) and rejected by others
+    # Experimental. Whether to send the model's reasoning content back on assistant tool-call messages in subsequent
+    # turns. Required by some thinking models (e.g. DeepSeek thinking mode) and rejected by others.
+    # The reasoning is kept in memory by the provider instance, so it is available only within one process lifetime
+    # and is reliable only for a single conversation per provider instance: it is omitted after a restart and when
+    # identical tool calls from different conversations make the association ambiguous
     @display {label: "Preserve Reasoning Content"}
     boolean preserveReasoningContent = false;
 |};
@@ -165,7 +168,7 @@ type ToolCallFunction record {
 
 type ResponseToolCall record {
     string? id?;
-    string 'type?;
+    string? 'type?;
     ToolCallFunction 'function?;
 };
 
@@ -180,7 +183,7 @@ type ResponseMessage record {
 };
 
 type ChatChoice record {
-    int index?;
+    int? index?;
     ResponseMessage message?;
     string? finish_reason?;
 };
@@ -193,7 +196,7 @@ type Usage record {
 
 type ChatCompletionResponse record {
     string? id?;
-    string model?;
+    string? model?;
     ChatChoice[]? choices?;
     Usage? usage?;
 };

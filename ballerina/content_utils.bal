@@ -130,10 +130,11 @@ isolated function joinTextParts(map<json>[] parts) returns string {
     return text;
 }
 
-# Builds an `image_url` content part for an image document.
+# Builds an `image_url` content part for an image document. For binary content without a `mimeType`, the type is
+# detected from the image signature, since several servers (e.g. vLLM, llama.cpp) reject `image/*` data URLs.
 #
 # + doc - The image document
-# + return - The content part, or an `ai:Error` if the URL is invalid
+# + return - The content part, or an `ai:Error` if the URL is invalid or the image type cannot be determined
 isolated function buildImagePart(ai:ImageDocument doc) returns map<json>|ai:Error {
     ai:Url|byte[] content = doc.content;
     string url;
@@ -144,10 +145,44 @@ isolated function buildImagePart(ai:ImageDocument doc) returns map<json>|ai:Erro
         }
         url = content;
     } else {
-        url = string `data:${doc.metadata?.mimeType ?: "image/*"};base64,${content.toBase64()}`;
+        string? mimeType = doc.metadata?.mimeType ?: detectImageMimeType(content);
+        if mimeType is () {
+            return error ai:Error("Unable to determine the image type. Set 'metadata.mimeType' of the image " +
+                    "document (e.g. 'image/png').");
+        }
+        url = string `data:${mimeType};base64,${content.toBase64()}`;
     }
     return {'type: "image_url", image_url: {url}};
 }
+
+# Detects the MIME type of an image from its signature (PNG, JPEG, GIF or WebP).
+#
+# + content - The image bytes
+# + return - The MIME type, or `()` if the signature is not recognized
+isolated function detectImageMimeType(byte[] content) returns string? {
+    if startsWithBytes(content, [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) {
+        return "image/png";
+    }
+    if startsWithBytes(content, [0xFF, 0xD8, 0xFF]) {
+        return "image/jpeg";
+    }
+    if startsWithBytes(content, "GIF87a".toBytes()) || startsWithBytes(content, "GIF89a".toBytes()) {
+        return "image/gif";
+    }
+    if startsWithBytes(content, "RIFF".toBytes()) && content.length() >= 12
+            && content.slice(8, 12) == "WEBP".toBytes() {
+        return "image/webp";
+    }
+    return ();
+}
+
+# Checks whether a byte array starts with the given prefix.
+#
+# + content - The bytes
+# + prefix - The prefix
+# + return - `true` if `content` starts with `prefix`
+isolated function startsWithBytes(byte[] content, byte[] prefix) returns boolean =>
+    content.length() >= prefix.length() && content.slice(0, prefix.length()) == prefix;
 
 # Builds an `input_audio` content part for an audio document. Only binary audio content is supported.
 #

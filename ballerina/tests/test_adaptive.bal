@@ -323,3 +323,214 @@ function getResponseFormatType(map<json> body) returns json {
     json responseFormat = body["response_format"];
     return responseFormat is map<json> ? responseFormat["type"] : ();
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Unsupported-field detection and remembered fallbacks
+// ---------------------------------------------------------------------------------------------------------------------
+
+const STYLE_PATTERN_SCHEMA = "patternschema";
+const STYLE_KEYWORD_SCHEMA = "keywordschema";
+
+@test:Config {groups: ["adaptive"]}
+function testUnsupportedFieldRequiresFieldAndReasonInSameDiagnostic() {
+    json body = {
+        "detail": [
+            {"loc": ["body", "max_tokens"], "msg": "Input should be less than or equal to 4096"},
+            {"loc": ["body", "foo"], "msg": "Extra inputs are not permitted"}
+        ]
+    };
+    ai:LlmConnectionError err = error ai:LlmConnectionError("rejected", statusCode = 422, body = body.toJsonString());
+    test:assertFalse(isUnsupportedFieldError(err, "max_tokens"),
+            "A value error on 'max_tokens' combined with an unrelated diagnostic must not count as unsupported");
+
+    json unsupported = {"detail": [{"loc": ["body", "max_tokens"], "msg": "Extra inputs are not permitted"}]};
+    ai:LlmConnectionError unsupportedErr = error ai:LlmConnectionError("rejected", statusCode = 422,
+            body = unsupported.toJsonString());
+    test:assertTrue(isUnsupportedFieldError(unsupportedErr, "max_tokens"));
+
+    json openAiStyle = {"error": {"message": "Unrecognized request argument supplied", "param": "max_tokens"}};
+    ai:LlmConnectionError openAiErr = error ai:LlmConnectionError("rejected", statusCode = 400,
+            body = openAiStyle.toJsonString());
+    test:assertTrue(isUnsupportedFieldError(openAiErr, "max_tokens"),
+            "The message and param of one error object form a single diagnostic");
+}
+
+@test:Config {groups: ["adaptive"]}
+function testJsonSchemaBareKeywordRejectionDoesNotFallBack() returns error? {
+    ModelProvider schemaProvider = check new (mockUrl(STYLE_KEYWORD_SCHEMA), TEST_MODEL, TEST_API_KEY,
+            compatibility = {structuredOutputMode: JSON_SCHEMA});
+    int initialCount = getRequestCount(STYLE_KEYWORD_SCHEMA);
+    Review|error result = schemaProvider->generate(`GEN_REVIEW Please review this blog: ${blog2.title}`);
+    if result !is ai:LlmConnectionError {
+        test:assertFail(string `Expected ai:LlmConnectionError, found: ${describe(result)}`);
+    }
+    test:assertTrue(result.message().includes(MOCK_BARE_KEYWORD_ERROR),
+            string `The schema error must propagate, found: ${result.message()}`);
+    test:assertEquals(getRequestCount(STYLE_KEYWORD_SCHEMA), initialCount + 1,
+            "An error that names response_format only as its param must not trigger the json_object fallback");
+}
+
+@test:Config {groups: ["adaptive"]}
+function testJsonSchemaKeywordRejectionDoesNotFallBack() returns error? {
+    ModelProvider schemaProvider = check new (mockUrl(STYLE_PATTERN_SCHEMA), TEST_MODEL, TEST_API_KEY,
+            compatibility = {structuredOutputMode: JSON_SCHEMA});
+    int initialCount = getRequestCount(STYLE_PATTERN_SCHEMA);
+    Review|error result = schemaProvider->generate(`GEN_REVIEW Please review this blog: ${blog2.title}`);
+    if result !is ai:LlmConnectionError {
+        test:assertFail(string `Expected ai:LlmConnectionError, found: ${describe(result)}`);
+    }
+    test:assertTrue(result.message().includes(MOCK_SCHEMA_KEYWORD_ERROR),
+            string `The schema error must propagate, found: ${result.message()}`);
+    test:assertEquals(getRequestCount(STYLE_PATTERN_SCHEMA), initialCount + 1,
+            "A rejected schema keyword must not trigger the json_object fallback");
+}
+
+@test:Config {groups: ["adaptive"]}
+function testMaxTokensFallbackIsNotRememberedAfterEmptyRetry() returns error? {
+    ModelProvider oProvider = check new (mockUrl(OSERIES), "o4-mini", TEST_API_KEY, maxTokens = 32);
+    ai:ChatAssistantMessage|ai:Error first = oProvider->chat({role: ai:USER, content: "TRIGGER_EMPTY_CHOICES hi"});
+    test:assertTrue(first is ai:LlmInvalidResponseError, string `Expected an empty response error: ${describe(first)}`);
+
+    int initialCount = getRequestCount(OSERIES);
+    _ = check oProvider->chat({role: ai:USER, content: "Next question"});
+    map<json>[] bodies = getRequestBodiesSince(OSERIES, initialCount);
+    test:assertEquals(bodies.length(), 2, "The next call must start again with 'max_tokens'");
+    test:assertTrue(bodies[0].hasKey("max_tokens"));
+}
+
+@test:Config {groups: ["adaptive"]}
+function testAutoToolChoiceFallbackIsNotRememberedAfterEmptyRetry() returns error? {
+    ModelProvider zaiProvider = check new (mockUrl(ZAI), "glm-4.6", TEST_API_KEY);
+    int|error first = zaiProvider->generate(`GEN_INT TRIGGER_EMPTY_CHOICES What is 1 + 1?`);
+    test:assertTrue(first is error, "An empty retry must fail");
+
+    int initialCount = getRequestCount(ZAI);
+    int second = check zaiProvider->generate(`GEN_INT What is 1 + 1?`);
+    test:assertEquals(second, 2);
+    map<json>[] bodies = getRequestBodiesSince(ZAI, initialCount);
+    test:assertEquals(bodies.length(), 2, "The next call must try a forced tool choice again");
+    test:assertEquals(bodies[0]["tool_choice"], FORCED_RESULTS_TOOL_CHOICE);
+}
+
+@test:Config {groups: ["adaptive"]}
+function testMaxTokensFallbackWorksWithShortApiKey() returns error? {
+    ModelProvider oProvider = check new (mockUrl(OSERIES), "o4-mini", "a", maxTokens = 16);
+    int initialCount = getRequestCount(OSERIES);
+    ai:ChatAssistantMessage response = check oProvider->chat({role: ai:USER, content: "Short key"});
+    test:assertEquals(response.content, MOCK_TEXT_RESPONSE_PREFIX + "Short key");
+    test:assertEquals(getRequestCount(OSERIES), initialCount + 2,
+            "Redacting a short key must not prevent the 'max_completion_tokens' retry");
+}
+
+@test:Config {groups: ["adaptive"]}
+function testJsonSchemaFormatUnsupportedDetection() {
+    [json, boolean][] cases = [
+        [{"error": {"message": "For response_format, patternProperties is not supported"}}, false],
+        [{"error": {"param": "response_format", "message": "patternProperties is not supported"}}, false],
+        [{"error": {"message": "Invalid schema for response_format 'x': 'patternProperties' is not supported"}}, false],
+        [{"error": {"message": MOCK_JSON_SCHEMA_ERROR}}, true],
+        [{"error": {"message": "Unrecognized request argument supplied: response_format"}}, true],
+        [{"error": {"message": "response_format is not supported by this model"}}, true],
+        [{"detail": [{"loc": ["body", "response_format"], "msg": "Extra inputs are not permitted"}]}, true]
+    ];
+    foreach [json, boolean] [body, expected] in cases {
+        ai:LlmConnectionError err = error ai:LlmConnectionError("rejected", statusCode = 400,
+                body = body.toJsonString());
+        test:assertEquals(isJsonSchemaFormatUnsupported(err), expected, body.toJsonString());
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Tool calling and JSON mode fallback detection
+// ---------------------------------------------------------------------------------------------------------------------
+
+const STYLE_TOOL_FAILED = "toolfailed";
+
+@test:Config {groups: ["adaptive"]}
+function testToolCallingUnsupportedDetection() {
+    [json, boolean][] cases = [
+        // The server does not support the forced tool choice or tool calling.
+        [{"error": {"message": MOCK_ZAI_TOOL_CHOICE_ERROR}}, true],
+        [{"error": {"message": MOCK_NO_TOOLS_ERROR}}, true],
+        [{"error": {"message": "Unsupported parameter: 'tools' is not supported with this model.", "param": "tools"}},
+            true],
+        [{"error": {"message": "\"auto\" tool choice requires --enable-auto-tool-choice and --tool-call-parser to be set"}},
+            true],
+        [{"detail": [{"loc": ["body", "tool_choice"], "msg": "Extra inputs are not permitted"}]}, true],
+        // A failed tool call produced by the model (Groq).
+        [{"error": {"message": MOCK_TOOL_USE_FAILED_ERROR, "type": "invalid_request_error", "code": "tool_use_failed"}},
+            false],
+        // A rejected tool definition (OpenAI).
+        [
+            {
+                "error": {
+                    "message": "Invalid schema for function 'getResults': In context=(), 'additionalProperties' is " +
+                        "required to be supplied and to be false.",
+                    "type": "invalid_request_error",
+                    "param": "tools[0].function.parameters",
+                    "code": "invalid_function_parameters"
+                }
+            },
+            false
+        ],
+        [{"error": {"message": "Invalid 'tools[0].function.name': string does not match pattern.", "param": "tools[0].function.name"}},
+            false],
+        // Unrelated errors that mention tools.
+        [{"error": {"message": "The tool call arguments are too long"}}, false],
+        [{"error": {"message": MOCK_CONTEXT_LENGTH_ERROR}}, false]
+    ];
+    foreach [json, boolean] [body, expected] in cases {
+        ai:LlmConnectionError err = error ai:LlmConnectionError("rejected", statusCode = 400,
+                body = body.toJsonString());
+        test:assertEquals(isToolCallingUnsupported(err), expected, body.toJsonString());
+    }
+    ai:LlmConnectionError serverError = error ai:LlmConnectionError("failed", statusCode = 500,
+            body = {"error": {"message": MOCK_NO_TOOLS_ERROR}}.toJsonString());
+    test:assertFalse(isToolCallingUnsupported(serverError), "Only request rejections (400/422) count");
+}
+
+@test:Config {groups: ["adaptive"]}
+function testToolUseFailedDoesNotFallBack() returns error? {
+    ModelProvider groqProvider = check new (mockUrl(STYLE_TOOL_FAILED), "llama-3.3-70b-versatile", TEST_API_KEY);
+    foreach int attempt in 0 ..< 2 {
+        int initialCount = getRequestCount(STYLE_TOOL_FAILED);
+        int|error result = groqProvider->generate(`GEN_INT What is 1 + 1?`);
+        if result !is ai:LlmConnectionError {
+            test:assertFail(string `Expected ai:LlmConnectionError, found: ${describe(result)}`);
+        }
+        test:assertTrue(result.message().includes(MOCK_TOOL_USE_FAILED_ERROR), result.message());
+        test:assertEquals(getRequestCount(STYLE_TOOL_FAILED), initialCount + 1,
+                "A failed tool call must not trigger the tool choice or JSON mode fallback");
+        map<json> body = getLastRequestBody(STYLE_TOOL_FAILED);
+        test:assertTrue(body.hasKey("tools"), string `Attempt ${attempt}: tool calling must not be disabled`);
+        test:assertEquals(body["tool_choice"], FORCED_RESULTS_TOOL_CHOICE,
+                string `Attempt ${attempt}: the forced tool choice must not be disabled`);
+    }
+}
+
+@test:Config {groups: ["adaptive"]}
+function testJsonObjectFallbackRequiresUnsupportedResponseFormat() {
+    [json, boolean][] cases = [
+        [{"error": {"message": MOCK_NO_RESPONSE_FORMAT_ERROR}}, true],
+        [{"error": {"message": "Invalid parameter: 'response_format' of type 'json_object' is not supported with this model."}},
+            true],
+        [{"detail": [{"loc": ["body", "response_format"], "msg": "Extra inputs are not permitted"}]}, true],
+        // The server supports `json_object` but rejected the request for another reason.
+        [
+            {
+                "error": {
+                    "message": "'messages' must contain the word 'json' in some form, to use 'response_format' of " +
+                        "type 'json_object'.",
+                    "param": "messages"
+                }
+            },
+            false
+        ],
+        [{"error": {"message": "Invalid value for 'response_format.type'.", "param": "response_format"}}, false]
+    ];
+    foreach [json, boolean] [body, expected] in cases {
+        ai:LlmConnectionError err = error ai:LlmConnectionError("rejected", statusCode = 400,
+                body = body.toJsonString());
+        test:assertEquals(isUnsupportedFieldError(err, "response_format"), expected, body.toJsonString());
+    }
+}

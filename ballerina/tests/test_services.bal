@@ -29,6 +29,8 @@ import ballerina/http;
 // - `notools`      : rejects any request carrying `tools` (Ollama-style "does not support tools"),
 //                    accepts `json_object`
 // - `bare`         : rejects any request carrying `tools` and any request carrying `response_format`
+// - `toolfailed`   : rejects any request carrying `tools` with Groq's `tool_use_failed` error (a failed tool call
+//                    produced by the model, not a lack of tool support), accepts requests without `tools`
 // - `maxtokens`    : a standard server with prompt-triggered max tokens rejections (see `mockMaxTokensRejection`)
 //
 // Error and edge-case behaviour is selected by trigger strings in the last user message.
@@ -48,6 +50,8 @@ const MOCK_BARE_KEYWORD_ERROR = "patternProperties is not supported";
 const MOCK_CLOSE_TAG_STRING = "a</think>c";
 const MOCK_THINK_TAG_STRING = "a<think>b</think>c";
 const MOCK_NO_TOOLS_ERROR = "registry.ollama.ai/library/x does not support tools";
+const MOCK_TOOL_USE_FAILED_ERROR = "Failed to call a function. Please adjust your prompt. See 'failed_generation' " +
+        "for more details.";
 const MOCK_NO_RESPONSE_FORMAT_ERROR = "Unrecognized request argument supplied: response_format";
 const MOCK_CONTEXT_LENGTH_ERROR = "Request too large: context length exceeded (8192 tokens).";
 const MOCK_MAX_COMPLETION_TOKENS_ERROR = "Unsupported parameter: 'max_completion_tokens' is not supported " +
@@ -210,6 +214,16 @@ isolated function mockHandleChatCompletion(string style, map<json> body, map<str
     if (style == "notools" || style == "bare") && body.hasKey("tools") {
         return mockErrorResponse(400, MOCK_NO_TOOLS_ERROR);
     }
+    if style == "toolfailed" && body.hasKey("tools") {
+        return mockJsonResponse(400, {
+            "error": {
+                "message": MOCK_TOOL_USE_FAILED_ERROR,
+                "type": "invalid_request_error",
+                "code": "tool_use_failed",
+                "failed_generation": "<function=getResults>{\"value\": 2}</function>"
+            }
+        });
+    }
     if style == "bare" && body.hasKey("response_format") {
         return mockErrorResponse(400, MOCK_NO_RESPONSE_FORMAT_ERROR);
     }
@@ -244,6 +258,27 @@ isolated function mockHandleChatCompletion(string style, map<json> body, map<str
         response.statusCode = 200;
         response.setTextPayload("<html><body><h1>Welcome to the gateway</h1></body></html>", "text/html");
         return response;
+    }
+    if prompt.includes("TRIGGER_NULL_FIELDS") {
+        // Some servers send explicit nulls for optional fields.
+        return mockJsonResponse(200, {
+            "id": (),
+            "object": "chat.completion",
+            "model": (),
+            "choices": [
+                {
+                    "index": (),
+                    "message": {
+                        "role": "assistant",
+                        "content": (),
+                        "tool_calls": [
+                            {"id": "call_null_1", "type": (), "function": {"name": "getWeather", "arguments": "{}"}}
+                        ]
+                    },
+                    "finish_reason": "tool_calls"
+                }
+            ]
+        });
     }
     if prompt.includes("TRIGGER_EMPTY_CHOICES") {
         return mockJsonResponse(200, {

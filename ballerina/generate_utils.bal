@@ -210,9 +210,8 @@ isolated function sendToolCallRequest(GenerateRequestContext ctx) returns Genera
     int requestsSent = 1;
     GenerateAttempt attempt = sendToolCallRequestWithMode(ctx, mode);
     ChatCompletionResponse|ai:Error response = attempt.response;
-    if response is ai:Error && mode == FORCED && configuredMode is ()
-            && (isFieldRejected(response, "tool_choice") || isFieldRejected(response, "tool")) {
-        log:printDebug(string `The server rejected a forced tool choice for model '${ctx.modelType}'; ` +
+    if response is ai:Error && mode == FORCED && configuredMode is () && isToolCallingUnsupported(response) {
+        log:printWarn(string `The server rejected a forced tool choice for model '${ctx.modelType}'; ` +
                 "retrying with 'tool_choice: auto'. Set 'compatibility.toolChoiceMode' to skip this retry",
                 statusCode = getStatusCode(response));
         mode = AUTO;
@@ -225,8 +224,8 @@ isolated function sendToolCallRequest(GenerateRequestContext ctx) returns Genera
         }
     }
 
-    if response is ai:Error && mode != FORCED && isFieldRejected(response, "tool") {
-        log:printDebug(string `The server rejected tool calling for model '${ctx.modelType}'; ` +
+    if response is ai:Error && mode != FORCED && isToolCallingUnsupported(response) {
+        log:printWarn(string `The server rejected tool calling for model '${ctx.modelType}'; ` +
                 "falling back to the JSON object strategy. Set 'compatibility.structuredOutputMode' to " +
                 "'JSON_OBJECT' to skip this retry", statusCode = getStatusCode(response));
         GenerateAttempt fallback = sendJsonObjectRequest(ctx, MAX_GENERATE_REQUESTS - requestsSent);
@@ -306,8 +305,8 @@ isolated function sendJsonObjectRequest(GenerateRequestContext ctx, int maxReque
 
     GenerateAttempt attempt = sendGenerateChatCompletion(ctx, messages, {response_format: {'type: "json_object"}});
     ChatCompletionResponse|ai:Error response = attempt.response;
-    if response is ai:Error && isFieldRejected(response, "response_format") {
-        log:printDebug(string `The server rejected 'response_format' of type 'json_object' for model '${
+    if response is ai:Error && isUnsupportedFieldError(response, "response_format") {
+        log:printWarn(string `The server rejected 'response_format' of type 'json_object' for model '${
                 ctx.modelType}'; retrying without 'response_format'`, statusCode = getStatusCode(response));
         GenerateAttempt retryAttempt = sendGenerateChatCompletion(ctx, messages, {});
         if isUsableResponse(retryAttempt.response) {
@@ -349,6 +348,52 @@ isolated function isJsonSchemaFormatUnsupported(error err) returns boolean {
                 || re `unsupported (response_format|json_schema)`.find(text) !is ()
                 || re `\[body, ?response_format\] extra (inputs|fields)`.find(text) !is () {
             return true;
+        }
+    }
+    return false;
+}
+
+# Request fields and feature names that identify tool calling in a provider error.
+final readonly & string[] TOOL_CALLING_TERMS = ["tool_choice", "tool choice", "tools", "tool calling", "tool use",
+    "function calling"];
+
+# Phrases stating that a tool calling field or feature is unsupported (as opposed to a failed or invalid tool call).
+final readonly & string[] TOOL_CALLING_UNSUPPORTED_MARKERS = ["unsupported", "not supported", "does not support",
+    "doesn't support", "only supports", "unknown", "unrecognized", "not allowed", "not permitted", "extra inputs",
+    "extra fields", "unexpected", "enable-auto-tool-choice"];
+
+# Checks whether the server rejected tool calling, or the forced `tool_choice`, as unsupported. A tool calling term
+# and an unsupported marker must appear in the same diagnostic (e.g. "tool_choice only supports auto",
+# "... does not support tools"). The following errors do not count, since the server supports the feature and a
+# fallback would be remembered for the lifetime of the provider instance:
+# - a failed tool call produced by the model (e.g. Groq's `tool_use_failed`)
+# - a rejected tool definition (e.g. `param: "tools[0].function.parameters"`)
+# - a rejected schema
+#
+# + err - The error
+# + return - `true` if the server rejected tool calling or the forced tool choice as unsupported
+isolated function isToolCallingUnsupported(error err) returns boolean {
+    if !isRequestRejected(err) || isSchemaRejected(err) {
+        return false;
+    }
+    foreach string diagnostic in getProviderErrorDiagnostics(err) {
+        if diagnostic.includes("tool_use_failed") || diagnostic.includes("tools[") {
+            continue;
+        }
+        boolean namesToolCalling = false;
+        foreach string term in TOOL_CALLING_TERMS {
+            if diagnostic.includes(term) {
+                namesToolCalling = true;
+                break;
+            }
+        }
+        if !namesToolCalling {
+            continue;
+        }
+        foreach string marker in TOOL_CALLING_UNSUPPORTED_MARKERS {
+            if diagnostic.includes(marker) {
+                return true;
+            }
         }
     }
     return false;
@@ -468,7 +513,7 @@ isolated function getGetResultsTool(map<json> parameters) returns json[] => [
     }
 ];
 
-# Extracts the JSON output from a choice: the `getResults` tool call arguments (or the first tool call's), or
+# Extracts the JSON output from a choice: the `getResults` tool call arguments (or those of the only tool call), or
 # otherwise JSON extracted from the text content.
 #
 # + choice - The first choice of the response
@@ -514,8 +559,10 @@ isolated function extractGenerateOutput(ChatChoice choice, ResponseSchema respon
     return error ai:LlmInvalidGenerationError(string `${GENERATE_NO_RELEVANT_RESPONSE}: ${reason}`);
 }
 
-# Selects the tool call carrying the result: the one named `getResults`, otherwise the first tool call, otherwise
-# the deprecated `function_call`.
+# Selects the tool call carrying the result: the one named `getResults`. A call with another name is used only when
+# it is the only tool call, since `getResults` is the only tool offered and small models sometimes misspell its name
+# (e.g. `get_results`). When there are several tool calls and none is `getResults`, no call is selected, so the
+# output is extracted from the text content instead. Falls back to the deprecated `function_call`.
 #
 # + message - The response message
 # + return - The selected tool call function, or `()`
@@ -528,12 +575,7 @@ isolated function selectResultToolCall(ResponseMessage message) returns ToolCall
                 return func;
             }
         }
-        foreach ResponseToolCall toolCall in toolCalls {
-            ToolCallFunction? func = toolCall?.'function;
-            if func is ToolCallFunction {
-                return func;
-            }
-        }
+        return toolCalls.length() == 1 ? toolCalls[0]?.'function : ();
     }
     return message?.function_call;
 }

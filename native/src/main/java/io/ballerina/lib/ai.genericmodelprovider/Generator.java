@@ -24,8 +24,8 @@ import io.ballerina.runtime.api.values.BObject;
 import io.ballerina.runtime.api.values.BTypedesc;
 
 /**
- * Native entry point for the dependently-typed {@code generate} method of the generic (OpenAI-compatible) model provider.
- * It reads the provider state and calls back the Ballerina function {@code generateLlmResponse}.
+ * Native entry point for the dependently-typed {@code generate} method of the generic (OpenAI-compatible) model
+ * provider. It reads the provider state and calls back the Ballerina function {@code generateLlmResponse}.
  *
  * <p>The field names read here are a contract with {@code ballerina/model-provider.bal}.</p>
  *

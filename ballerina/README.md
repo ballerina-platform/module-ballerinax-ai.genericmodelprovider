@@ -25,11 +25,17 @@ OpenAI-compatible servers differ in small ways. Instead of requiring provider-sp
 - Reads reasoning output from either `reasoning_content` or `reasoning`, removes inline `<think>` blocks from
   responses, and accepts tool call arguments as a JSON string or an object.
 
-A fallback is used only when the server's error message names the rejected feature, and it is remembered for the
-lifetime of the provider instance only after the fallback request succeeds, so it costs at most one extra request.
-The max-tokens fallback is logged as a warning; the other remembered fallbacks are logged at the debug level. To
-avoid the extra request, set the matching [compatibility](#compatibility-configuration) field (for example,
-`maxTokensField: MAX_COMPLETION_TOKENS` for OpenAI reasoning models such as `gpt-5`).
+A fallback is used only when the server's error message states that the field or feature is unsupported, and it is
+remembered for the lifetime of the provider instance only after the fallback request succeeds. Each fallback is
+logged as a warning. To avoid the extra requests, set the matching
+[compatibility](#compatibility-configuration) field (for example, `maxTokensField: MAX_COMPLETION_TOKENS` for OpenAI
+reasoning models such as `gpt-5`).
+
+> **Request cost:** until the fallbacks are learned, a single `generate` call can send up to six billable requests:
+> up to three structured-output strategies (forced tool choice, `tool_choice: "auto"`, JSON mode), each of which may be
+> retried once with the other max tokens field. `chat` sends at most two. Once a fallback is remembered, later calls
+> on the same provider instance send one request. Setting the [compatibility](#compatibility-configuration) fields
+> up front avoids the extra requests entirely.
 
 ## Quickstart
 
@@ -129,12 +135,12 @@ automatically, or to skip the first failed request when you already know what th
 |---|---|---|
 | `maxTokensField` | Auto-detected | `MAX_TOKENS` or `MAX_COMPLETION_TOKENS` |
 | `toolChoiceMode` | Auto-detected | How `generate` requests the result tool: `FORCED`, `AUTO`, or `NONE` (omit `tool_choice`) |
-| `structuredOutputMode` | `TOOL_CALL` | How `generate` obtains structured output: `TOOL_CALL`, `JSON_SCHEMA` (`response_format`), or `JSON_OBJECT` (JSON mode with the schema in the prompt). With `JSON_SCHEMA`, a server that does not support `json_schema` causes a `JSON_OBJECT` retry on every call, so prefer `JSON_OBJECT` for such servers |
+| `structuredOutputMode` | `TOOL_CALL` | How `generate` obtains structured output: `TOOL_CALL`, `JSON_SCHEMA` (`response_format`), or `JSON_OBJECT` (JSON mode with the schema in the prompt). `JSON_SCHEMA` does not send `strict: true`, so whether the schema is enforced depends on the server: self-hosted servers such as vLLM and Ollama enforce it, while on OpenAI it is only guidance. The response is always validated against the expected type. A server that does not support `json_schema` causes a `JSON_OBJECT` retry on every call, so prefer `JSON_OBJECT` for such servers |
 | `systemRole` | `SYSTEM` | Role used for system messages: `SYSTEM` or `DEVELOPER` |
 | `extraHeaders` | `{}` | Additional headers sent with every request |
 | `extraBody` | `{}` | Additional top-level request fields (e.g. provider-specific parameters) |
 | `dropParams` | `[]` | Top-level request fields that must never be sent |
-| `preserveReasoningContent` | `false` | Send reasoning content back with assistant tool-call messages (required by some thinking models such as DeepSeek in thinking mode) |
+| `preserveReasoningContent` | `false` | **Experimental.** Send reasoning content back with assistant tool-call messages (required by some thinking models such as DeepSeek in thinking mode). The reasoning is kept in memory by the provider instance, so it works only within one process lifetime and is reliable only for a single conversation per provider instance; it is omitted after a restart or when identical tool calls from different conversations make it ambiguous |
 
 Example: passing a provider-specific parameter (Z.ai thinking mode).
 

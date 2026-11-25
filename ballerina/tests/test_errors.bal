@@ -84,3 +84,69 @@ function testModelProviderInitWithEmptyServiceUrl() {
 function testModelProviderInitAcceptsTrailingSlash() returns error? {
     ModelProvider _ = check new (mockUrl(STANDARD) + "/", TEST_MODEL, TEST_API_KEY);
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Credential redaction
+// ---------------------------------------------------------------------------------------------------------------------
+
+@test:Config {groups: ["errors"]}
+function testEchoedCredentialIsRedactedFromError() {
+    ai:ChatAssistantMessage|ai:Error result = secretKeyProvider->chat(
+            {role: ai:USER, content: "TRIGGER_ECHO_AUTH hello"});
+    assertConnectionErrorWithoutSecret(result, 401);
+    if result is ai:Error {
+        test:assertTrue(result.message().includes(REDACTED_CREDENTIAL),
+                string `The credential must be replaced with a placeholder, found: ${result.message()}`);
+        test:assertFalse(getErrorBody(result).includes(TEST_SECRET_API_KEY),
+                "The API key must not appear in the error body");
+    }
+}
+
+@test:Config {groups: ["errors"]}
+function testRedactCredentialsCoversCredentialHeaders() {
+    map<string> & readonly headers = {
+        "Authorization": "Bearer sk-bearer-secret-1",
+        "x-api-key": "api-key-secret-2",
+        "X-Request-Source": "integration-tests"
+    };
+    string redacted = redactCredentials(
+            "a sk-bearer-secret-1 b api-key-secret-2 c integration-tests sk-bearer-secret-1", headers);
+    test:assertEquals(redacted, "a *** b *** c integration-tests ***");
+}
+
+@test:Config {groups: ["errors"]}
+function testShortCredentialIsRedacted() returns error? {
+    test:assertEquals(redactCredentials("bad key: k1", {"Authorization": "Bearer k1"}), "bad key: ***");
+
+    ModelProvider shortKeyProvider = check new (mockUrl(STANDARD), TEST_MODEL, "sk-7");
+    ai:ChatAssistantMessage|ai:Error result = shortKeyProvider->chat(
+            {role: ai:USER, content: "TRIGGER_ECHO_AUTH hello"});
+    if result !is ai:LlmConnectionError {
+        test:assertFail(string `Expected ai:LlmConnectionError, found: ${describe(result)}`);
+    }
+    test:assertFalse(result.toString().includes("sk-7"), "A short API key must not appear in the error");
+    test:assertFalse(getErrorBody(result).includes("sk-7"), "A short API key must not appear in the error body");
+}
+
+@test:Config {groups: ["errors"]}
+function testJsonEscapedCredentialIsRedacted() returns error? {
+    map<string> & readonly headers = {"x-api-key": "abc\"def12"};
+    test:assertEquals(redactCredentials("{\"error\": \"bad key abc\\\"def12\"}", headers), "{\"error\": \"bad key ***\"}");
+
+    string quotedKey = "k\"y";
+    ModelProvider quotedKeyProvider = check new (mockUrl(STANDARD), TEST_MODEL, quotedKey);
+    ai:ChatAssistantMessage|ai:Error result = quotedKeyProvider->chat(
+            {role: ai:USER, content: "TRIGGER_ECHO_AUTH hello"});
+    if result !is ai:LlmConnectionError {
+        test:assertFail(string `Expected ai:LlmConnectionError, found: ${describe(result)}`);
+    }
+    test:assertFalse(result.message().includes(quotedKey), "The decoded key must not appear in the message");
+    test:assertFalse(getErrorBody(result).includes("k\\\"y"), "The escaped key must not appear in the body");
+    test:assertTrue(result.message().includes(REDACTED_CREDENTIAL));
+}
+
+@test:Config {groups: ["errors"]}
+function testShortCredentialIsRedactedOnlyWhereItStandsAlone() {
+    test:assertEquals(redactCredentials("key a rejected; 'max_tokens' is not supported",
+            {"Authorization": "Bearer a"}), "key *** rejected; 'max_tokens' is not supported");
+}

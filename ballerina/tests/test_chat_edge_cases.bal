@@ -197,3 +197,154 @@ function getSingleToolCallArguments(string trigger) returns map<json>?|error {
     }
     return toolCalls[0].arguments;
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Tool call IDs and reasoning
+// ---------------------------------------------------------------------------------------------------------------------
+
+@test:Config {groups: ["chat"]}
+function testFallbackToolCallIdsSkipExplicitIds() returns error? {
+    ai:ChatMessage[] messages = [
+        {role: ai:USER, content: "Weather?"},
+        {
+            role: ai:ASSISTANT,
+            toolCalls: [
+                {name: "getWeather", id: "call_getWeather_1", arguments: {"city": "Colombo"}},
+                {name: "getWeather", arguments: {"city": "Kandy"}}
+            ]
+        },
+        {role: "function", name: "getWeather", id: "call_getWeather_1", content: "31C"},
+        {role: "function", name: "getWeather", content: "27C"}
+    ];
+    json[] request = check buildChatRequestMessages(messages, SYSTEM, ());
+    map<json> assistant = check asMap(request[1]);
+    map<json>[] toolCalls = getToolCalls(assistant);
+    test:assertEquals(toolCalls[0]["id"], "call_getWeather_1");
+    test:assertEquals(toolCalls[1]["id"], "call_getWeather_2",
+            "A fallback ID must not reuse an explicit ID in the transcript");
+    test:assertEquals((check asMap(request[3]))["tool_call_id"], "call_getWeather_2");
+}
+
+@test:Config {groups: ["chat"]}
+function testReasoningIsPreservedForToolCallWithoutId() returns error? {
+    ReasoningStore store = new;
+    ai:ChatAssistantMessage assistant = check convertToAssistantMessage(check toChoice({
+        "message": {
+            "role": "assistant",
+            "reasoning_content": MOCK_REASONING_TEXT,
+            "tool_calls": [{"id": (), "type": "function", "function": {"name": "getWeather", "arguments": "{}"}}]
+        }
+    }), store);
+    json[] request = check buildChatRequestMessages([{role: ai:USER, content: "Weather?"}, assistant], SYSTEM, store);
+    test:assertEquals((check asMap(request[1]))["reasoning_content"], MOCK_REASONING_TEXT);
+}
+
+@test:Config {groups: ["chat"]}
+function testReusedToolCallIdKeepsReasoningOfItsOwnResponse() returns error? {
+    ReasoningStore store = new;
+    ai:ChatAssistantMessage first = check convertToAssistantMessage(check toChoice(
+            toolCallChoice("call_0", "{\"city\":\"Colombo\"}", "Reasoning of conversation A")), store);
+    ai:ChatAssistantMessage second = check convertToAssistantMessage(check toChoice(
+            toolCallChoice("call_0", "{\"city\":\"Kandy\"}", "Reasoning of conversation B")), store);
+
+    json[] requestA = check buildChatRequestMessages([{role: ai:USER, content: "A"}, first], SYSTEM, store);
+    json[] requestB = check buildChatRequestMessages([{role: ai:USER, content: "B"}, second], SYSTEM, store);
+    test:assertEquals((check asMap(requestA[1]))["reasoning_content"], "Reasoning of conversation A");
+    test:assertEquals((check asMap(requestB[1]))["reasoning_content"], "Reasoning of conversation B");
+}
+
+function toolCallChoice(string id, string arguments, string reasoning) returns json => {
+    "message": {
+        "role": "assistant",
+        "reasoning_content": reasoning,
+        "tool_calls": [{"id": id, "type": "function", "function": {"name": "getWeather", "arguments": arguments}}]
+    }
+};
+
+function toChoice(json choice) returns ChatChoice|error => choice.cloneWithType();
+
+function asMap(json value) returns map<json>|error => value.ensureType();
+
+@test:Config {groups: ["chat"]}
+function testIdenticalToolCallsWithDifferentReasoningOmitReasoning() returns error? {
+    foreach string? id in ["call_0", ()] {
+        ReasoningStore store = new;
+        ai:ChatAssistantMessage first = check convertToAssistantMessage(check toChoice(
+                toolCallChoiceWithId(id, "{\"city\":\"Colombo\"}", "Reasoning of conversation A")), store);
+        ai:ChatAssistantMessage second = check convertToAssistantMessage(check toChoice(
+                toolCallChoiceWithId(id, "{\"city\":\"Colombo\"}", "Reasoning of conversation B")), store);
+
+        json[] requestA = check buildChatRequestMessages([{role: ai:USER, content: "A"}, first], SYSTEM, store);
+        json[] requestB = check buildChatRequestMessages([{role: ai:USER, content: "B"}, second], SYSTEM, store);
+        test:assertFalse((check asMap(requestA[1])).hasKey("reasoning_content"),
+                "Reasoning must be omitted when its response cannot be identified");
+        test:assertFalse((check asMap(requestB[1])).hasKey("reasoning_content"),
+                "Reasoning must be omitted when its response cannot be identified");
+    }
+}
+
+@test:Config {groups: ["chat"]}
+function testIdenticalToolCallsWithSameReasoningKeepReasoning() returns error? {
+    ReasoningStore store = new;
+    ai:ChatAssistantMessage first = check convertToAssistantMessage(check toChoice(
+            toolCallChoiceWithId((), "{}", MOCK_REASONING_TEXT)), store);
+    _ = check convertToAssistantMessage(check toChoice(toolCallChoiceWithId((), "{}", MOCK_REASONING_TEXT)), store);
+    json[] request = check buildChatRequestMessages([{role: ai:USER, content: "A"}, first], SYSTEM, store);
+    test:assertEquals((check asMap(request[1]))["reasoning_content"], MOCK_REASONING_TEXT);
+}
+
+function toolCallChoiceWithId(string? id, string arguments, string reasoning) returns json => {
+    "message": {
+        "role": "assistant",
+        "reasoning_content": reasoning,
+        "tool_calls": [{"id": id, "type": "function", "function": {"name": "getWeather", "arguments": arguments}}]
+    }
+};
+
+@test:Config {groups: ["chat"]}
+function testToolCallWithoutReasoningMakesIdenticalCallAmbiguous() returns error? {
+    foreach boolean reasoningFirst in [true, false] {
+        ReasoningStore store = new;
+        json withReasoning = toolCallChoiceWithId((), "{}", MOCK_REASONING_TEXT);
+        json withoutReasoning = {
+            "message": {
+                "role": "assistant",
+                "tool_calls": [{"id": (), "type": "function", "function": {"name": "getWeather", "arguments": "{}"}}]
+            }
+        };
+        ai:ChatAssistantMessage first = check convertToAssistantMessage(
+                check toChoice(reasoningFirst ? withReasoning : withoutReasoning), store);
+        ai:ChatAssistantMessage second = check convertToAssistantMessage(
+                check toChoice(reasoningFirst ? withoutReasoning : withReasoning), store);
+        foreach ai:ChatAssistantMessage assistant in [first, second] {
+            json[] request = check buildChatRequestMessages([{role: ai:USER, content: "Q"}, assistant], SYSTEM, store);
+            test:assertFalse((check asMap(request[1])).hasKey("reasoning_content"),
+                    "Reasoning must be omitted when an identical call arrived without reasoning");
+        }
+    }
+}
+
+@test:Config {groups: ["chat"]}
+function testEvictedReasoningKeyIsAmbiguousWhenReused() {
+    ReasoningStore store = new;
+    store.put("reused-key", "Reasoning of conversation A");
+    foreach int i in 0 ..< MAX_REASONING_ENTRIES {
+        store.put(string `other-key-${i}`, "Other reasoning");
+    }
+    test:assertEquals(store.get("reused-key"), (), "The oldest key must have been evicted");
+    store.put("reused-key", "Reasoning of conversation B");
+    test:assertEquals(store.get("reused-key"), (),
+            "A key evicted earlier must not return reasoning that may belong to another conversation");
+}
+
+@test:Config {groups: ["chat"]}
+function testResponseWithExplicitNullFieldsIsAccepted() returns error? {
+    ai:ChatAssistantMessage response = check provider->chat({role: ai:USER, content: "TRIGGER_NULL_FIELDS weather?"});
+    ai:FunctionCall[]? toolCalls = response.toolCalls;
+    if toolCalls is () {
+        test:assertFail("Expected a tool call");
+    }
+    test:assertEquals(toolCalls[0].name, "getWeather");
+    test:assertEquals(toolCalls[0].id, "call_null_1");
+}
+

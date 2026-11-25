@@ -472,14 +472,6 @@ isolated function getProviderErrorDiagnostics(error err, boolean includeParam = 
         select diagnostic.toLowerAscii();
 }
 
-# Checks whether an error is a request rejection whose provider error text mentions the given term.
-#
-# + err - The error
-# + term - The term to look for (e.g. a request field name such as `max_tokens`)
-# + return - `true` if the server rejected the request and its error text mentions the term
-isolated function isFieldRejected(error err, string term) returns boolean =>
-    isRequestRejected(err) && getProviderErrorText(err).includes(term.toLowerAscii());
-
 # Checks whether an error is a request rejection stating that the given field is unsupported or unknown
 # (as opposed to having an invalid value). The field and the rejection reason must appear in the same diagnostic, so
 # that an unrelated diagnostic (e.g. another field that is not permitted) does not count as rejecting the field.

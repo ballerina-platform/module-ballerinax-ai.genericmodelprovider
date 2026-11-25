@@ -97,7 +97,8 @@ function testGenerateWithImageBytes() returns error? {
     map<json> imagePart = check getImagePart(content);
     map<json> imageUrl = check imagePart["image_url"].cloneWithType();
     string url = check imageUrl["url"].ensureType();
-    test:assertTrue(url.startsWith("data:image/"), string `Expected a data URL, found: ${url}`);
+    test:assertTrue(url.startsWith("data:image/png;base64,"),
+            string `Expected a PNG data URL detected from the bytes, found: ${url}`);
     test:assertTrue(url.endsWith(sampleImageBytes.toBase64()), "The data URL must carry the base64-encoded bytes");
 }
 
@@ -148,4 +149,129 @@ function getImagePart(json content) returns map<json>|error {
     test:assertTrue(hasText, "Expected a text part alongside the image part");
     test:assertEquals(imageParts.length(), 1, "Expected exactly one image_url part");
     return imageParts[0];
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Output parsing
+// ---------------------------------------------------------------------------------------------------------------------
+
+@test:Config {groups: ["generate"]}
+function testGeneratePreservesThinkTagsInsideJsonStrings() returns error? {
+    string result = check provider->generate(`GEN_THINK_STRING Say something`);
+    test:assertEquals(result, MOCK_THINK_TAG_STRING);
+}
+
+@test:Config {groups: ["generate"]}
+function testGeneratePreservesThinkTagsInsideFencedJson() returns error? {
+    ModelProvider ollamaProvider = check new (mockUrl(OLLAMA), "llama3.2");
+    string result = check ollamaProvider->generate(`GEN_THINK_STRING Say something`);
+    test:assertEquals(result, MOCK_THINK_TAG_STRING);
+}
+
+@test:Config {groups: ["generate"]}
+function testGenerateIgnoresDraftJsonInLeadingThinkBlock() returns error? {
+    ModelProvider ollamaProvider = check new (mockUrl(OLLAMA), "llama3.2");
+    int result = check ollamaProvider->generate(`GEN_INT GEN_THINK_PREFIX What is 1 + 1?`);
+    test:assertEquals(result, 2);
+}
+
+@test:Config {groups: ["generate"]}
+function testExtractJsonFromTextFallsBackToRemovingAllThinkBlocks() {
+    ParsedJson? parsed = extractJsonFromText("Answer: <think>maybe {broken</think> {\"a\": 1}");
+    test:assertEquals(parsed, {value: {"a": 1}});
+}
+
+@test:Config {groups: ["generate"]}
+function testGenerateBareNullTextForNilableType() returns error? {
+    ModelProvider ollamaProvider = check new (mockUrl(OLLAMA), "llama3.2");
+    string? result = check ollamaProvider->generate(`GEN_BARE_NULL Tell me nothing`);
+    test:assertEquals(result, ());
+}
+
+@test:Config {groups: ["generate"]}
+function testWrappedSchemaKeepsRootDefinitions() {
+    map<json> schema = {
+        "type": "array",
+        "items": {"$ref": "#/$defs/Entry"},
+        "$defs": {"Entry": {"type": "object", "properties": {"name": {"type": "string"}}}}
+    };
+    ResponseSchema wrapped = generateJsonObjectSchema(schema);
+    test:assertFalse(wrapped.isOriginallyJsonObject);
+    test:assertEquals(wrapped.schema["$defs"], schema["$defs"]);
+    test:assertEquals(wrapped.schema["properties"], {"result": {"type": "array", "items": {"$ref": "#/$defs/Entry"}}});
+}
+
+@test:Config {groups: ["generate"]}
+function testGeneratePreservesClosingThinkTagInsideFencedJson() returns error? {
+    ModelProvider ollamaProvider = check new (mockUrl(OLLAMA), "llama3.2");
+    string result = check ollamaProvider->generate(`GEN_CLOSE_TAG_STRING Say something`);
+    test:assertEquals(result, MOCK_CLOSE_TAG_STRING);
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Result tool selection
+// ---------------------------------------------------------------------------------------------------------------------
+
+@test:Config {groups: ["generate"]}
+function testSelectResultToolCall() returns error? {
+    ResponseMessage getResultsAmongOthers = check {
+        "role": "assistant",
+        "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "search", "arguments": "{\"q\": \"x\"}"}},
+            {"id": "c2", "type": "function", "function": {"name": "getResults", "arguments": "{\"value\": 2}"}}
+        ]
+    }.cloneWithType();
+    test:assertEquals(selectResultToolCall(getResultsAmongOthers)?.name, "getResults");
+
+    ResponseMessage onlyMisspelledCall = check {
+        "role": "assistant",
+        "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "get_results", "arguments": "{}"}}]
+    }.cloneWithType();
+    test:assertEquals(selectResultToolCall(onlyMisspelledCall)?.name, "get_results",
+            "The only tool call must be used even when its name is misspelled");
+
+    ResponseMessage severalOtherCalls = check {
+        "role": "assistant",
+        "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "search", "arguments": "{}"}},
+            {"id": "c2", "type": "function", "function": {"name": "lookup", "arguments": "{}"}}
+        ]
+    }.cloneWithType();
+    test:assertEquals(selectResultToolCall(severalOtherCalls), (),
+            "When none of several tool calls is getResults, none may be used as the result");
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Image MIME type detection
+// ---------------------------------------------------------------------------------------------------------------------
+
+@test:Config {groups: ["generate"]}
+function testDetectImageMimeType() {
+    test:assertEquals(detectImageMimeType(sampleImageBytes), "image/png");
+    test:assertEquals(detectImageMimeType([0xFF, 0xD8, 0xFF, 0xE0, 0, 0x10]), "image/jpeg");
+    test:assertEquals(detectImageMimeType("GIF89a....".toBytes()), "image/gif");
+    test:assertEquals(detectImageMimeType("RIFF\u{0}\u{0}\u{0}\u{0}WEBPVP8 ".toBytes()), "image/webp");
+    test:assertEquals(detectImageMimeType("RIFF\u{0}\u{0}\u{0}\u{0}WAVEfmt ".toBytes()), ());
+    test:assertEquals(detectImageMimeType([1, 2, 3]), ());
+    test:assertEquals(detectImageMimeType([]), ());
+}
+
+@test:Config {groups: ["generate"]}
+function testImageMimeTypeFromMetadataIsKept() returns error? {
+    byte[] content = [1, 2, 3, 4];
+    ai:ImageDocument image = {content, metadata: {mimeType: "image/heic"}};
+    map<json> part = check buildImagePart(image);
+    test:assertEquals(part["image_url"], {"url": string `data:image/heic;base64,${content.toBase64()}`});
+}
+
+@test:Config {groups: ["generate"]}
+function testUnknownImageTypeWithoutMimeTypeIsRejected() {
+    ai:ImageDocument image = {content: [1, 2, 3, 4]};
+    int initialCount = getRequestCount(STANDARD);
+    string|error result = provider->generate(`GEN_IMAGE Describe this image: ${image}`);
+    if result !is ai:Error {
+        test:assertFail(string `Expected ai:Error, found: ${describe(result)}`);
+    }
+    test:assertTrue(result.message().includes("mimeType"), result.message());
+    test:assertEquals(getRequestCount(STANDARD), initialCount, "No request may be sent for an unknown image type");
 }
