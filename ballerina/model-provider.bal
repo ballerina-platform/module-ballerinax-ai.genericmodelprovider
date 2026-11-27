@@ -25,7 +25,7 @@ import ballerina/log;
 #
 # The provider uses the most widely supported request shape by default and adapts automatically when the
 # server rejects an optional feature. Use `compatibility` to fine-tune the behaviour for a specific server.
-@display {label: "Generic Model Provider (OpenAI-compatible)"}
+@display {label: "Generic Model Provider"}
 public isolated distinct client class ModelProvider {
     *ai:ModelProvider;
 

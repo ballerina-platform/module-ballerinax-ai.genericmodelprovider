@@ -4,6 +4,9 @@ This file documents all significant changes made to the Ballerina ai.genericmode
 
 ## [Un-released]
 
+### Changed
+- Display the provider as `Generic Model Provider` instead of `Generic Model Provider (OpenAI-compatible)`
+
 ### Added
 - [Add a generic OpenAI-compatible model provider](https://github.com/wso2-enterprise/integration-product-management/issues/1025)
   - Works with any service exposing the OpenAI Chat Completions API by configuring the service URL, API key and a free-form model name.
